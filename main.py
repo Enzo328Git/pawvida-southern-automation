@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "PawVida Southern Automation"
-VERSION = "7.0.0"
+VERSION = "8.0.0"
 
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "pawvida-6")
@@ -973,13 +973,161 @@ async def mixed_serp_final_rows(per_category:int=4):
     return final
 
 
+
+def candidate_score(row):
+    """
+    Cheap pre-benchmark score using only Southern-side data.
+    Higher score = better candidate to spend SerpApi quota on.
+    """
+    name = (row.get("product") or "").lower()
+    category = row.get("source_category") or "general"
+    stock = int(row.get("stock") or 0)
+    weight_kg = parse_weight_kg(row.get("weight"))
+    cost = float(row.get("southern_cost_ex_gst") or 0)
+
+    category_base = {
+        "bedding": 100,
+        "grooming": 90,
+        "toys": 80,
+        "walking": 85,
+        "health": 65,
+        "food": 35,
+        "general": 50,
+    }.get(category, 50)
+
+    score = category_base
+
+    # Stock depth
+    if stock >= 10:
+        score += 15
+    elif stock >= 5:
+        score += 10
+    elif stock >= 2:
+        score += 5
+    elif stock <= 0:
+        score -= 100
+
+    # Freight efficiency
+    if weight_kg is None:
+        score += 0
+    elif weight_kg <= 1:
+        score += 18
+    elif weight_kg <= 3:
+        score += 12
+    elif weight_kg <= 5:
+        score += 6
+    elif weight_kg >= 15:
+        score -= 18
+    elif weight_kg >= 10:
+        score -= 10
+
+    # Avoid tying too much cash into expensive low-margin products
+    if cost < 20:
+        score += 10
+    elif cost < 50:
+        score += 6
+    elif cost > 120:
+        score -= 10
+
+    # Product-type hints
+    if any(x in name for x in ["bed", "mat", "blanket", "crate mat"]):
+        score += 12
+    if any(x in name for x in ["brush", "comb", "shampoo", "groom"]):
+        score += 10
+    if any(x in name for x in ["lead", "leash", "harness", "collar"]):
+        score += 10
+    if any(x in name for x in ["toy", "kong", "ball", "chew"]):
+        score += 8
+    if any(x in name for x in ["20kg", "15kg", "13kg"]):
+        score -= 12
+
+    return round(score, 1)
+
+async def broader_candidate_pool(per_category:int=20):
+    """
+    Pull a broader Southern sample per category without SerpApi.
+    """
+    per_category = min(max(per_category, 5), 40)
+    client = await southern_authenticated_client()
+    price_rows = []
+    try:
+        for category, url in MIXED_CATEGORY_URLS.items():
+            r = await client.get(url)
+            if r.status_code >= 400:
+                continue
+            rows = parse_southern_products(r.text, per_category)
+            for row in rows:
+                price_rows.append({**row, "source_category": category, "source_url": str(r.url)})
+    finally:
+        await client.aclose()
+
+    commercial = await commercial_rows_from_price_rows(price_rows)
+    for r in commercial:
+        r["candidate_score"] = candidate_score(r)
+    commercial.sort(key=lambda x: x["candidate_score"], reverse=True)
+    return commercial
+
+async def benchmark_top_candidates(total:int=20, per_category_scan:int=20):
+    """
+    Benchmark only the strongest candidates across the broader pool.
+    """
+    total = min(max(total, 1), 30)
+    pool = await broader_candidate_pool(per_category_scan)
+
+    # Preserve category diversity: max 8 benchmarked from any one category.
+    picked = []
+    counts = {}
+    for r in pool:
+        cat = r.get("source_category") or "general"
+        if counts.get(cat, 0) >= 8:
+            continue
+        if r.get("stock", 0) <= 0:
+            continue
+        picked.append(r)
+        counts[cat] = counts.get(cat, 0) + 1
+        if len(picked) >= total:
+            break
+
+    final = []
+    for r in picked:
+        market = await live_market_for_product(r)
+        required = r["proposed_price"]
+        hold = list(r.get("hold_reason") or [])
+
+        if r["stock"] <= 0:
+            status = "TEMP_OUT_OF_STOCK"
+        elif not r["passes_margin"]:
+            status = "COMMERCIAL_HOLD"
+            hold.append("margin")
+        elif not market["verified"]:
+            status = "REVIEW_MARKET"
+            hold.append("market_unverified")
+        elif required > market["market_ceiling"]:
+            status = "COMMERCIAL_HOLD"
+            hold.append("market_price")
+        else:
+            status = "APPROVED_DRAFT"
+
+        final.append({
+            **r,
+            "market_verified": market["verified"],
+            "market_offer_count": market["offer_count"],
+            "market_benchmark": market["benchmark_price"],
+            "market_ceiling": market["market_ceiling"],
+            "market_offers": market["offers"],
+            "final_status": status,
+            "hold_reason": list(dict.fromkeys(hold)),
+        })
+    return final
+
+
 @app.get("/")
 async def root():
     return {
         "service": APP_NAME, "status":"running", "version":VERSION, "dry_run":DRY_RUN,
         "next":["/health","/shopify/test","/southern/stock-preview","/southern/gtin-preview",
                 "/southern/login-test","/southern/pricing-preview","/southern/commercial-preview",
-                "/southern/commercial-table","/market/benchmark-preview","/southern/final-commercial-table","/market/serpapi-test","/southern/serp-commercial-table","/southern/mixed-market-table"]
+                "/southern/commercial-table","/market/benchmark-preview","/southern/final-commercial-table","/market/serpapi-test","/southern/serp-commercial-table","/southern/mixed-market-table","/southern/candidate-table","/southern/top-candidates-market-table"]
     }
 
 @app.get("/health")
@@ -1346,6 +1494,102 @@ async def mixed_market_table(per_category:int=4):
     <th>Benchmark</th><th>Ceiling</th><th>Margin</th><th>Status</th>
     </tr></thead><tbody>{''.join(trs)}</tbody></table>
     </body></html>
+    """
+    return HTMLResponse(html)
+
+
+
+@app.get("/southern/candidate-pool")
+async def candidate_pool(per_category:int=20, limit:int=50):
+    pool = await broader_candidate_pool(per_category)
+    limit = min(max(limit,1),100)
+    return {
+        "ok": True,
+        "dry_run": DRY_RUN,
+        "count": len(pool),
+        "rows": pool[:limit],
+        "note": "No SerpApi calls. Southern-only ranking."
+    }
+
+@app.get("/southern/candidate-table", response_class=HTMLResponse)
+async def candidate_table(per_category:int=20, limit:int=50):
+    pool = await broader_candidate_pool(per_category)
+    limit = min(max(limit,1),100)
+    rows = pool[:limit]
+    trs = []
+    for r in rows:
+        trs.append(
+            f"<tr><td>{r.get('candidate_score')}</td><td>{r.get('source_category')}</td>"
+            f"<td>{r.get('sku')}</td><td>{r.get('product')}</td>"
+            f"<td>${r.get('southern_cost_ex_gst'):.2f}</td><td>{r.get('stock')}</td>"
+            f"<td>{r.get('weight') or ''}</td><td>${r.get('proposed_price'):.2f}</td>"
+            f"<td>{r.get('margin_rate')*100:.1f}%</td></tr>"
+        )
+    html=f"""
+    <html><head><title>PawVida Candidate Pool</title>
+    <style>
+    body{{font-family:Arial,sans-serif;margin:26px;color:#1f2d22}}
+    table{{border-collapse:collapse;width:100%;font-size:12px}}
+    th,td{{border-bottom:1px solid #ddd;padding:8px;text-align:left}}
+    th{{background:#eef4ed;position:sticky;top:0}}
+    </style></head><body>
+    <h1>PawVida — Candidate Pool</h1>
+    <p>Southern-only ranking. No SerpApi calls. No Shopify changes.</p>
+    <table><thead><tr><th>Score</th><th>Category</th><th>SKU</th><th>Product</th>
+    <th>Southern Cost ex GST</th><th>Stock</th><th>Weight</th><th>Required Price</th>
+    <th>Margin</th></tr></thead><tbody>{''.join(trs)}</tbody></table>
+    </body></html>
+    """
+    return HTMLResponse(html)
+
+@app.get("/southern/top-candidates-market-table", response_class=HTMLResponse)
+async def top_candidates_market_table(total:int=20, per_category_scan:int=20):
+    total = min(max(total,1),30)
+    rows = await benchmark_top_candidates(total, per_category_scan)
+
+    summary={}
+    for r in rows:
+        cat=r.get("source_category") or "general"
+        summary.setdefault(cat, {"APPROVED_DRAFT":0,"COMMERCIAL_HOLD":0,"TEMP_OUT_OF_STOCK":0,"REVIEW_MARKET":0})
+        summary[cat][r["final_status"]] = summary[cat].get(r["final_status"],0)+1
+
+    cards="".join(
+        f"<div class='card'><b>{cat.title()}</b><br>"
+        f"Approved {vals.get('APPROVED_DRAFT',0)} | Hold {vals.get('COMMERCIAL_HOLD',0)} | "
+        f"Review {vals.get('REVIEW_MARKET',0)}</div>"
+        for cat, vals in summary.items()
+    )
+
+    trs=[]
+    for r in rows:
+        offers="<br>".join(f"{o.get('retailer')}: ${o.get('price'):.2f}" for o in r.get("market_offers",[])[:3]) or "—"
+        bench="—" if r["market_benchmark"] is None else f"${r['market_benchmark']:.2f}"
+        ceiling="—" if r["market_ceiling"] is None else f"${r['market_ceiling']:.2f}"
+        trs.append(
+            f"<tr><td>{r.get('candidate_score')}</td><td>{r.get('source_category')}</td>"
+            f"<td>{r.get('sku')}</td><td>{r.get('product')}</td><td>${r.get('southern_cost_ex_gst'):.2f}</td>"
+            f"<td>{r.get('stock')}</td><td>${r.get('proposed_price'):.2f}</td><td>{offers}</td>"
+            f"<td>{bench}</td><td>{ceiling}</td><td>{r.get('margin_rate')*100:.1f}%</td>"
+            f"<td><b>{r.get('final_status')}</b></td></tr>"
+        )
+
+    html=f"""
+    <html><head><title>PawVida Top Candidates Market Test</title>
+    <style>
+    body{{font-family:Arial,sans-serif;margin:26px;color:#1f2d22}}
+    .summary{{display:flex;gap:10px;flex-wrap:wrap;margin:15px 0}}
+    .card{{background:#eef4ed;border-radius:8px;padding:12px 14px;min-width:180px}}
+    table{{border-collapse:collapse;width:100%;font-size:12px}}
+    th,td{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}
+    th{{background:#eef4ed;position:sticky;top:0}}
+    </style></head><body>
+    <h1>PawVida — Top Candidate Market Test</h1>
+    <p>Dry run. Benchmarks only the highest-ranked Southern candidates.</p>
+    <div class='summary'>{cards}</div>
+    <table><thead><tr><th>Score</th><th>Category</th><th>SKU</th><th>Product</th>
+    <th>Southern Cost ex GST</th><th>Stock</th><th>Required Price</th><th>Accepted Offers</th>
+    <th>Benchmark</th><th>Ceiling</th><th>Margin</th><th>Status</th></tr></thead>
+    <tbody>{''.join(trs)}</tbody></table></body></html>
     """
     return HTMLResponse(html)
 
