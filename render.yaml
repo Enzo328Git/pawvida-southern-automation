@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: pawvida-southern-automation
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: SHOPIFY_SHOP
+        value: pawvida-6
+      - key: SHOPIFY_API_VERSION
+        value: 2026-07
+      - key: SHOPIFY_CLIENT_ID
+        sync: false
+      - key: SHOPIFY_CLIENT_SECRET
+        sync: false
+      - key: SOUTHERN_STOCK_URL
+        value: https://www.agline.com/stock-level-csv/
+      - key: SOUTHERN_GTIN_URL
+        value: https://www.southernpetsupplies.com.au/resources/product-barcode-gtin-list/
+      - key: DRY_RUN
+        value: "true"

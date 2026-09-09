@@ -1,0 +1,21 @@
+PAWVIDA - NEXT STEPS (RAILWAY RECOMMENDED)
+
+1. Create a PRIVATE GitHub repository named pawvida-southern-automation.
+2. Upload all files from this package to that repository.
+3. In Railway, choose New Project > Deploy from GitHub repo.
+4. Select pawvida-southern-automation.
+5. In Railway > Variables, add:
+   SHOPIFY_SHOP = pawvida-6
+   SHOPIFY_API_VERSION = 2026-07
+   SHOPIFY_CLIENT_ID = your Client ID
+   SHOPIFY_CLIENT_SECRET = your Client Secret
+   SOUTHERN_STOCK_URL = https://www.agline.com/stock-level-csv/
+   SOUTHERN_GTIN_URL = https://www.southernpetsupplies.com.au/resources/product-barcode-gtin-list/
+   DRY_RUN = true
+6. Deploy.
+7. Railway will give you a public service domain.
+8. Open https://YOUR-DOMAIN/health
+9. Then open /shopify/test
+10. Then /southern/stock-preview and /southern/gtin-preview.
+
+Do not send the Client Secret in ChatGPT and do not put it into GitHub source files.
