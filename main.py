@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "PawVida Southern Automation"
-VERSION = "11.1.0"
+VERSION = "12.0.0"
 
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "pawvida-6")
@@ -769,56 +769,138 @@ def filter_serp_offers(product_row, shopping_results):
     offers.sort(key=lambda x:x["price"])
     return offers
 
+
+def strip_operational_suffix(value: str | None) -> str:
+    """
+    Remove Southern page artefacts such as:
+    - trailing duplicate shipping weight + stock: '13.72 kg 5'
+    - trailing weight + stock: '0.2 kg 22'
+    - trailing stock counts
+    while preserving legitimate pack-size text earlier in the title.
+    """
+    s = re.sub(r"\s+", " ", value or "").strip()
+
+    # Remove common Southern UI phrases.
+    s = re.sub(r"\b(?:Add to cart|Product Info)\b.*$", "", s, flags=re.I).strip()
+
+    # Remove repeated trailing operational values.
+    patterns = [
+        r"\s+\d+(?:\.\d+)?\s*kg\s+\d+\s*$",
+        r"\s+\d+(?:\.\d+)?\s*g\s+\d+\s*$",
+        r"\s+\d+(?:\.\d+)?\s*ml\s+\d+\s*$",
+        r"\s+\d+(?:\.\d+)?\s*l\s+\d+\s*$",
+        r"\s+\d+(?:\.\d+)?\s+kg\s+\d+\s*$",
+        r"\s+\d+\s*$",
+    ]
+    for p in patterns:
+        s = re.sub(p, "", s, flags=re.I).strip()
+
+    return s.strip(" -|:")
+
 def clean_search_title(product: str) -> str:
-    s = re.sub(r"\s+", " ", product or "").strip()
-    # remove trailing duplicated operational numbers such as "13.72 kg 5"
-    s = re.sub(r"\s+\d+(?:\.\d+)?\s*kg\s+\d+\s*$", "", s, flags=re.I)
-    s = re.sub(r"\s+\d+(?:\.\d+)?\s+kg\s+\d+\s*$", "", s, flags=re.I)
-    s = re.sub(r"\s+\d+\s*$", "", s)
-    return s.strip(" -")
+    s = strip_operational_suffix(product)
+    # Remove duplicated adjacent pack data such as "13kg 13.72 kg".
+    s = re.sub(
+        r"(\b\d+(?:\.\d+)?\s*(?:kg|g|ml|l)\b)\s+\d+(?:\.\d+)?\s*(?:kg|g|ml|l)\b",
+        r"\1",
+        s,
+        flags=re.I
+    )
+    return re.sub(r"\s+", " ", s).strip()
 
-async def live_market_for_product(product_row):
+def meaningful_query_tokens(value: str | None):
+    stop = {
+        "adult","dog","dogs","cat","cats","all","with","and","the","for",
+        "original","current","price","was","small","medium","large"
+    }
+    toks = []
+    for t in normalize_product_text(value).split():
+        if t in stop:
+            continue
+        if re.fullmatch(r"\d+(?:\.\d+)?", t):
+            continue
+        toks.append(t)
+    return toks
+
+def build_market_queries(product_row):
+    """
+    Search strategy:
+    1. exact GTIN
+    2. clean full product title
+    3. brand + distinctive product/model terms + pack size
+    4. simplified product title + pack size
+    """
+    product = clean_search_title(product_row.get("product") or product_row.get("sku") or "")
     gtin = str(product_row.get("gtin") or "").strip()
-    clean_name = clean_search_title(product_row.get("product") or product_row.get("sku"))
-
     queries = []
+
     if gtin:
         queries.append(gtin)
-    queries.append(clean_name)
 
-    # simplified fallback query retaining brand/core name + pack size
-    packs = re.findall(r"\b\d+(?:\.\d+)?\s*(?:kg|g|ml|l)\b", clean_name, flags=re.I)
-    tokens = clean_search_title(clean_name).split()
-    simple = " ".join(tokens[:9])
-    if packs and packs[-1].lower() not in simple.lower():
-        simple += " " + packs[-1]
-    if simple and simple not in queries:
-        queries.append(simple)
+    if product:
+        queries.append(product)
 
-    all_offers=[]
-    used_queries=[]
-    for q in queries[:3]:
+    packs = re.findall(r"\b\d+(?:\.\d+)?\s*(?:kg|g|ml|l)\b", product, flags=re.I)
+    pack = packs[-1] if packs else ""
+
+    tokens = meaningful_query_tokens(product)
+    if tokens:
+        # retain first token (usually brand) + up to 6 distinctive terms
+        compact = " ".join(tokens[:7])
+        if pack and pack.lower() not in compact.lower():
+            compact += " " + pack
+        compact = compact.strip()
+        if compact and compact not in queries:
+            queries.append(compact)
+
+    # Broader fallback: first 5 title words + size.
+    words = product.split()
+    if words:
+        broad = " ".join(words[:5])
+        if pack and pack.lower() not in broad.lower():
+            broad += " " + pack
+        broad = broad.strip()
+        if broad and broad not in queries:
+            queries.append(broad)
+
+    # Return max 4 distinct queries.
+    out = []
+    for q in queries:
+        q = re.sub(r"\s+", " ", q).strip()
+        if q and q not in out:
+            out.append(q)
+    return out[:4]
+
+
+async def live_market_for_product(product_row):
+    queries = build_market_queries(product_row)
+    all_offers = []
+    used_queries = []
+
+    for q in queries:
         data = await serpapi_shopping_search(q)
         accepted = filter_serp_offers(product_row, data.get("shopping_results") or [])
         all_offers.extend(accepted)
         used_queries.append(q)
 
-        # stop early once we have enough distinct retailers
+        # stop as soon as enough distinct retailers are available
         if len({(o.get("retailer") or "").lower() for o in all_offers}) >= MIN_BENCHMARK_OFFERS:
             break
 
-    # dedupe across queries
-    dedup={}
+    # De-duplicate across fallback queries.
+    dedup = {}
     for o in all_offers:
-        dedup[((o.get("retailer") or "").lower(), o["price"], o["title"])]=o
-    offers=list(dedup.values())
-    offers.sort(key=lambda x:x["price"])
+        key = ((o.get("retailer") or "").lower(), o["price"], o["title"])
+        dedup[key] = o
+    offers = list(dedup.values())
+    offers.sort(key=lambda x: x["price"])
 
-    distinct=[]
-    seen=set()
+    # Keep one accepted offer per retailer for benchmark purposes.
+    distinct = []
+    seen = set()
     for o in offers:
-        retailer=(o.get("retailer") or "").lower()
-        if retailer in seen:
+        retailer = (o.get("retailer") or "").lower()
+        if not retailer or retailer in seen:
             continue
         seen.add(retailer)
         distinct.append(o)
@@ -834,55 +916,16 @@ async def live_market_for_product(product_row):
         }
 
     lowest = distinct[:3]
-    prices=sorted(o["price"] for o in lowest)
-    benchmark=prices[1]
-    ceiling=round(benchmark * MARKET_CEILING_MULTIPLIER,2)
+    prices = sorted(o["price"] for o in lowest)
+    benchmark = prices[1]
+    ceiling = round(benchmark * MARKET_CEILING_MULTIPLIER, 2)
+
     return {
         "verified": True,
         "queries": used_queries,
         "offer_count": len(distinct),
         "offers": distinct[:10],
-        "benchmark_price": round(benchmark,2),
-        "market_ceiling": ceiling,
-    }
-
-
-    gtin = str(product_row.get("gtin") or "").strip()
-    name = product_row.get("product") or product_row.get("sku")
-    query = gtin if gtin else name
-    data = await serpapi_shopping_search(query)
-    offers = filter_serp_offers(product_row, data.get("shopping_results") or [])
-
-    # require distinct credible retailers
-    distinct=[]
-    seen=set()
-    for o in offers:
-        retailer=(o.get("retailer") or "").lower()
-        if retailer in seen:
-            continue
-        seen.add(retailer)
-        distinct.append(o)
-
-    if len(distinct) < MIN_BENCHMARK_OFFERS:
-        return {
-            "verified": False,
-            "query": query,
-            "offer_count": len(distinct),
-            "offers": distinct[:10],
-            "benchmark_price": None,
-            "market_ceiling": None,
-        }
-
-    lowest = distinct[:3]
-    prices=sorted(o["price"] for o in lowest)
-    benchmark=prices[1]
-    ceiling=round(benchmark * MARKET_CEILING_MULTIPLIER,2)
-    return {
-        "verified": True,
-        "query": query,
-        "offer_count": len(distinct),
-        "offers": distinct[:10],
-        "benchmark_price": round(benchmark,2),
+        "benchmark_price": round(benchmark, 2),
         "market_ceiling": ceiling,
     }
 
@@ -955,7 +998,7 @@ async def commercial_rows_from_price_rows(price_rows):
         sku = p["sku"]
         g = gmap.get(sku, {})
         product = g.get("product_name") or p.get("title") or sku
-        product = clean_title(product, sku)
+        product = strip_operational_suffix(clean_title(product, sku))
         weight = g.get("weight") or p.get("page_weight")
         weight_kg = parse_weight_kg(weight)
         stock = smap.get(sku, 0)
@@ -1374,7 +1417,7 @@ async def commercial_rows(limit:int=50):
         sku=p["sku"]
         g=gmap.get(sku,{})
         product = g.get("product_name") or p.get("title") or sku
-        product = clean_title(product, sku)
+        product = strip_operational_suffix(clean_title(product, sku))
         weight = g.get("weight") or p.get("page_weight")
         weight_kg = parse_weight_kg(weight)
         stock = smap.get(sku,0)
@@ -1883,6 +1926,25 @@ async def launch_shortlist_table(per_category:int=60, benchmark_limit:int=25, ap
     """
     return HTMLResponse(html)
 
+
+
+@app.get("/market/query-preview")
+async def market_query_preview(per_category:int=60, limit:int=25):
+    candidates = await launch_candidate_pool(
+        per_category=min(max(per_category,1),100),
+        max_candidates=min(max(limit,1),100)
+    )
+    return {
+        "ok": True,
+        "count": len(candidates),
+        "rows": [{
+            "sku": r["sku"],
+            "product": r["product"],
+            "gtin": r.get("gtin"),
+            "queries": build_market_queries(r),
+        } for r in candidates],
+        "note": "No SerpApi calls. Query-quality diagnostic only."
+    }
 
 @app.post("/sync/stock")
 async def sync_stock():
