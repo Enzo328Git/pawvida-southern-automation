@@ -976,122 +976,83 @@ async def mixed_serp_final_rows(per_category:int=4):
 
 def candidate_score(row):
     """
-    Cheap pre-benchmark score using only Southern-side data.
-    Higher score = better candidate to spend SerpApi quota on.
+    Cheap Southern-only pre-screen. Higher score = better candidate for paid market lookup.
+    Favors margin, contribution, stock depth, lighter shipping and commercially attractive categories.
     """
-    name = (row.get("product") or "").lower()
-    category = row.get("source_category") or "general"
+    category_bonus = {
+        "bedding": 22,
+        "grooming": 20,
+        "walking": 18,
+        "toys": 16,
+        "general": 10,
+        "clothing": 6,
+        "mainstream_food": -12,
+    }.get(row.get("category_rule"), 8)
+
+    margin = float(row.get("margin_rate") or 0)
+    contribution = float(row.get("contribution") or 0)
     stock = int(row.get("stock") or 0)
     weight_kg = parse_weight_kg(row.get("weight"))
-    cost = float(row.get("southern_cost_ex_gst") or 0)
 
-    category_base = {
-        "bedding": 100,
-        "grooming": 90,
-        "toys": 80,
-        "walking": 85,
-        "health": 65,
-        "food": 35,
-        "general": 50,
-    }.get(category, 50)
+    margin_score = min(50, margin * 100)
+    contribution_score = min(25, contribution / 2)
+    stock_score = min(20, stock * 1.5)
 
-    score = category_base
-
-    # Stock depth
-    if stock >= 10:
-        score += 15
-    elif stock >= 5:
-        score += 10
-    elif stock >= 2:
-        score += 5
-    elif stock <= 0:
-        score -= 100
-
-    # Freight efficiency
     if weight_kg is None:
-        score += 0
-    elif weight_kg <= 1:
-        score += 18
-    elif weight_kg <= 3:
-        score += 12
+        freight_score = 2
+    elif weight_kg <= 0.5:
+        freight_score = 18
+    elif weight_kg <= 2:
+        freight_score = 14
     elif weight_kg <= 5:
-        score += 6
-    elif weight_kg >= 15:
-        score -= 18
-    elif weight_kg >= 10:
-        score -= 10
+        freight_score = 9
+    elif weight_kg <= 10:
+        freight_score = 3
+    else:
+        freight_score = -10
 
-    # Avoid tying too much cash into expensive low-margin products
-    if cost < 20:
-        score += 10
-    elif cost < 50:
-        score += 6
-    elif cost > 120:
-        score -= 10
+    low_stock_penalty = -15 if stock <= 2 else 0
+    no_margin_penalty = -50 if not row.get("passes_margin") else 0
 
-    # Product-type hints
-    if any(x in name for x in ["bed", "mat", "blanket", "crate mat"]):
-        score += 12
-    if any(x in name for x in ["brush", "comb", "shampoo", "groom"]):
-        score += 10
-    if any(x in name for x in ["lead", "leash", "harness", "collar"]):
-        score += 10
-    if any(x in name for x in ["toy", "kong", "ball", "chew"]):
-        score += 8
-    if any(x in name for x in ["20kg", "15kg", "13kg"]):
-        score -= 12
+    return round(
+        category_bonus + margin_score + contribution_score +
+        stock_score + freight_score + low_stock_penalty + no_margin_penalty,
+        1
+    )
 
-    return round(score, 1)
-
-async def broader_candidate_pool(per_category:int=20):
+async def candidate_pool(per_category:int=20, limit:int=50):
     """
-    Pull a broader Southern sample per category without SerpApi.
+    Build a Southern-only shortlist without SerpApi calls.
     """
-    per_category = min(max(per_category, 5), 40)
-    client = await southern_authenticated_client()
-    price_rows = []
-    try:
-        for category, url in MIXED_CATEGORY_URLS.items():
-            r = await client.get(url)
-            if r.status_code >= 400:
-                continue
-            rows = parse_southern_products(r.text, per_category)
-            for row in rows:
-                price_rows.append({**row, "source_category": category, "source_url": str(r.url)})
-    finally:
-        await client.aclose()
-
+    per_category = min(max(per_category, 1), 30)
+    price_rows = await mixed_price_rows(per_category)
     commercial = await commercial_rows_from_price_rows(price_rows)
+
+    # Remove duplicates across category pages.
+    dedup = {}
     for r in commercial:
-        r["candidate_score"] = candidate_score(r)
-    commercial.sort(key=lambda x: x["candidate_score"], reverse=True)
-    return commercial
+        sku = r["sku"]
+        score = candidate_score(r)
+        candidate = {**r, "candidate_score": score}
+        old = dedup.get(sku)
+        if old is None or score > old["candidate_score"]:
+            dedup[sku] = candidate
 
-async def benchmark_top_candidates(total:int=20, per_category_scan:int=20):
+    rows = list(dedup.values())
+    rows.sort(key=lambda x: (-x["candidate_score"], -x["stock"], x["proposed_price"]))
+    return rows[:min(max(limit,1),100)]
+
+async def top_candidate_market_rows(limit:int=25, per_category:int=20):
     """
-    Benchmark only the strongest candidates across the broader pool.
+    Spend SerpApi calls only on the strongest Southern-only candidates.
     """
-    total = min(max(total, 1), 30)
-    pool = await broader_candidate_pool(per_category_scan)
-
-    # Preserve category diversity: max 8 benchmarked from any one category.
-    picked = []
-    counts = {}
-    for r in pool:
-        cat = r.get("source_category") or "general"
-        if counts.get(cat, 0) >= 8:
-            continue
-        if r.get("stock", 0) <= 0:
-            continue
-        picked.append(r)
-        counts[cat] = counts.get(cat, 0) + 1
-        if len(picked) >= total:
-            break
-
+    limit = min(max(limit,1),25)
+    candidates = await candidate_pool(per_category=per_category, limit=max(limit,50))
+    chosen = candidates[:limit]
     final = []
-    for r in picked:
+
+    for r in chosen:
         market = await live_market_for_product(r)
-        required = r["proposed_price"]
         hold = list(r.get("hold_reason") or [])
 
         if r["stock"] <= 0:
@@ -1102,7 +1063,7 @@ async def benchmark_top_candidates(total:int=20, per_category_scan:int=20):
         elif not market["verified"]:
             status = "REVIEW_MARKET"
             hold.append("market_unverified")
-        elif required > market["market_ceiling"]:
+        elif r["proposed_price"] > market["market_ceiling"]:
             status = "COMMERCIAL_HOLD"
             hold.append("market_price")
         else:
@@ -1110,6 +1071,7 @@ async def benchmark_top_candidates(total:int=20, per_category_scan:int=20):
 
         final.append({
             **r,
+            "market_queries": market.get("queries") or [market.get("query")],
             "market_verified": market["verified"],
             "market_offer_count": market["offer_count"],
             "market_benchmark": market["benchmark_price"],
@@ -1500,96 +1462,117 @@ async def mixed_market_table(per_category:int=4):
 
 
 @app.get("/southern/candidate-pool")
-async def candidate_pool(per_category:int=20, limit:int=50):
-    pool = await broader_candidate_pool(per_category)
-    limit = min(max(limit,1),100)
+async def candidate_pool_preview(per_category:int=20, limit:int=50):
+    rows = await candidate_pool(per_category=per_category, limit=limit)
     return {
         "ok": True,
         "dry_run": DRY_RUN,
-        "count": len(pool),
-        "rows": pool[:limit],
-        "note": "No SerpApi calls. Southern-only ranking."
+        "count": len(rows),
+        "rows": rows,
+        "note": "Southern-only ranking. No SerpApi calls and no Shopify changes."
     }
 
 @app.get("/southern/candidate-table", response_class=HTMLResponse)
 async def candidate_table(per_category:int=20, limit:int=50):
-    pool = await broader_candidate_pool(per_category)
-    limit = min(max(limit,1),100)
-    rows = pool[:limit]
+    rows = await candidate_pool(per_category=per_category, limit=limit)
     trs = []
     for r in rows:
         trs.append(
-            f"<tr><td>{r.get('candidate_score')}</td><td>{r.get('source_category')}</td>"
-            f"<td>{r.get('sku')}</td><td>{r.get('product')}</td>"
-            f"<td>${r.get('southern_cost_ex_gst'):.2f}</td><td>{r.get('stock')}</td>"
-            f"<td>{r.get('weight') or ''}</td><td>${r.get('proposed_price'):.2f}</td>"
-            f"<td>{r.get('margin_rate')*100:.1f}%</td></tr>"
+            f"<tr><td>{r['candidate_score']:.1f}</td><td>{r.get('source_category','')}</td>"
+            f"<td>{r['sku']}</td><td>{r['product']}</td>"
+            f"<td>${r['southern_cost_ex_gst']:.2f}</td><td>{r['stock']}</td>"
+            f"<td>{r['weight'] or ''}</td><td>${r['proposed_price']:.2f}</td>"
+            f"<td>{r['margin_rate']*100:.1f}%</td></tr>"
         )
-    html=f"""
+    html = f"""
     <html><head><title>PawVida Candidate Pool</title>
     <style>
     body{{font-family:Arial,sans-serif;margin:26px;color:#1f2d22}}
     table{{border-collapse:collapse;width:100%;font-size:12px}}
-    th,td{{border-bottom:1px solid #ddd;padding:8px;text-align:left}}
+    th,td{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}
     th{{background:#eef4ed;position:sticky;top:0}}
     </style></head><body>
     <h1>PawVida — Candidate Pool</h1>
     <p>Southern-only ranking. No SerpApi calls. No Shopify changes.</p>
     <table><thead><tr><th>Score</th><th>Category</th><th>SKU</th><th>Product</th>
-    <th>Southern Cost ex GST</th><th>Stock</th><th>Weight</th><th>Required Price</th>
-    <th>Margin</th></tr></thead><tbody>{''.join(trs)}</tbody></table>
+    <th>Southern Cost ex GST</th><th>Stock</th><th>Weight</th><th>Required Price</th><th>Margin</th>
+    </tr></thead><tbody>{''.join(trs)}</tbody></table>
     </body></html>
     """
     return HTMLResponse(html)
 
-@app.get("/southern/top-candidates-market-table", response_class=HTMLResponse)
-async def top_candidates_market_table(total:int=20, per_category_scan:int=20):
-    total = min(max(total,1),30)
-    rows = await benchmark_top_candidates(total, per_category_scan)
-
-    summary={}
+@app.get("/southern/top-candidates-market-preview")
+async def top_candidates_market_preview(limit:int=25, per_category:int=20):
+    rows = await top_candidate_market_rows(limit=limit, per_category=per_category)
+    counts = {"APPROVED_DRAFT":0,"COMMERCIAL_HOLD":0,"TEMP_OUT_OF_STOCK":0,"REVIEW_MARKET":0}
+    by_category = {}
     for r in rows:
-        cat=r.get("source_category") or "general"
-        summary.setdefault(cat, {"APPROVED_DRAFT":0,"COMMERCIAL_HOLD":0,"TEMP_OUT_OF_STOCK":0,"REVIEW_MARKET":0})
-        summary[cat][r["final_status"]] = summary[cat].get(r["final_status"],0)+1
+        counts[r["final_status"]] = counts.get(r["final_status"],0) + 1
+        cat = r.get("source_category") or "unknown"
+        by_category.setdefault(cat, {"APPROVED_DRAFT":0,"COMMERCIAL_HOLD":0,"TEMP_OUT_OF_STOCK":0,"REVIEW_MARKET":0})
+        by_category[cat][r["final_status"]] = by_category[cat].get(r["final_status"],0) + 1
+    return {
+        "ok": True,
+        "dry_run": DRY_RUN,
+        "count": len(rows),
+        "summary": counts,
+        "summary_by_category": by_category,
+        "rows": rows,
+        "note": "Top Southern candidates only. No Shopify changes."
+    }
 
-    cards="".join(
-        f"<div class='card'><b>{cat.title()}</b><br>"
-        f"Approved {vals.get('APPROVED_DRAFT',0)} | Hold {vals.get('COMMERCIAL_HOLD',0)} | "
-        f"Review {vals.get('REVIEW_MARKET',0)}</div>"
-        for cat, vals in summary.items()
+@app.get("/southern/top-candidates-market-table", response_class=HTMLResponse)
+async def top_candidates_market_table(limit:int=25, per_category:int=20):
+    rows = await top_candidate_market_rows(limit=limit, per_category=per_category)
+
+    counts = {"APPROVED_DRAFT":0,"COMMERCIAL_HOLD":0,"TEMP_OUT_OF_STOCK":0,"REVIEW_MARKET":0}
+    for r in rows:
+        counts[r["final_status"]] = counts.get(r["final_status"],0) + 1
+
+    summary = (
+        f"Approved: {counts['APPROVED_DRAFT']} &nbsp; "
+        f"Hold: {counts['COMMERCIAL_HOLD']} &nbsp; "
+        f"Stockout: {counts['TEMP_OUT_OF_STOCK']} &nbsp; "
+        f"Review: {counts['REVIEW_MARKET']}"
     )
 
     trs=[]
     for r in rows:
-        offers="<br>".join(f"{o.get('retailer')}: ${o.get('price'):.2f}" for o in r.get("market_offers",[])[:3]) or "—"
-        bench="—" if r["market_benchmark"] is None else f"${r['market_benchmark']:.2f}"
-        ceiling="—" if r["market_ceiling"] is None else f"${r['market_ceiling']:.2f}"
+        offers = "<br>".join(
+            f"{o.get('retailer')}: ${o.get('price'):.2f}"
+            for o in r.get("market_offers",[])[:3]
+        ) or "—"
+        benchmark = "—" if r["market_benchmark"] is None else f"${r['market_benchmark']:.2f}"
+        ceiling = "—" if r["market_ceiling"] is None else f"${r['market_ceiling']:.2f}"
+
         trs.append(
-            f"<tr><td>{r.get('candidate_score')}</td><td>{r.get('source_category')}</td>"
-            f"<td>{r.get('sku')}</td><td>{r.get('product')}</td><td>${r.get('southern_cost_ex_gst'):.2f}</td>"
-            f"<td>{r.get('stock')}</td><td>${r.get('proposed_price'):.2f}</td><td>{offers}</td>"
-            f"<td>{bench}</td><td>{ceiling}</td><td>{r.get('margin_rate')*100:.1f}%</td>"
-            f"<td><b>{r.get('final_status')}</b></td></tr>"
+            f"<tr><td>{r['candidate_score']:.1f}</td><td>{r.get('source_category','')}</td>"
+            f"<td>{r['sku']}</td><td>{r['product']}</td>"
+            f"<td>${r['southern_cost_ex_gst']:.2f}</td><td>{r['stock']}</td>"
+            f"<td>${r['proposed_price']:.2f}</td><td>{offers}</td>"
+            f"<td>{benchmark}</td><td>{ceiling}</td>"
+            f"<td>{r['margin_rate']*100:.1f}%</td><td><b>{r['final_status']}</b></td></tr>"
         )
 
     html=f"""
-    <html><head><title>PawVida Top Candidates Market Test</title>
+    <html><head><title>PawVida Top Candidate Market Test</title>
     <style>
     body{{font-family:Arial,sans-serif;margin:26px;color:#1f2d22}}
-    .summary{{display:flex;gap:10px;flex-wrap:wrap;margin:15px 0}}
-    .card{{background:#eef4ed;border-radius:8px;padding:12px 14px;min-width:180px}}
+    .note{{padding:12px;background:#f3f6ef;border-radius:8px;margin:14px 0}}
     table{{border-collapse:collapse;width:100%;font-size:12px}}
     th,td{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}
     th{{background:#eef4ed;position:sticky;top:0}}
     </style></head><body>
     <h1>PawVida — Top Candidate Market Test</h1>
-    <p>Dry run. Benchmarks only the highest-ranked Southern candidates.</p>
-    <div class='summary'>{cards}</div>
-    <table><thead><tr><th>Score</th><th>Category</th><th>SKU</th><th>Product</th>
-    <th>Southern Cost ex GST</th><th>Stock</th><th>Required Price</th><th>Accepted Offers</th>
-    <th>Benchmark</th><th>Ceiling</th><th>Margin</th><th>Status</th></tr></thead>
-    <tbody>{''.join(trs)}</tbody></table></body></html>
+    <div class="note">Dry run. {len(rows)} highest-ranked Southern candidates. No Shopify changes.
+    Do not repeatedly refresh: uncached products can consume SerpApi searches.</div>
+    <h3>{summary}</h3>
+    <table><thead><tr>
+    <th>Score</th><th>Category</th><th>SKU</th><th>Product</th>
+    <th>Southern Cost ex GST</th><th>Stock</th><th>Required Price</th>
+    <th>Lowest accepted offers</th><th>Benchmark</th><th>Ceiling</th><th>Margin</th><th>Status</th>
+    </tr></thead><tbody>{''.join(trs)}</tbody></table>
+    </body></html>
     """
     return HTMLResponse(html)
 
