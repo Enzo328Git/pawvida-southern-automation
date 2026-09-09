@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "PawVida Southern Automation"
-VERSION = "6.0.0"
+VERSION = "7.0.0"
 
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "pawvida-6")
@@ -24,6 +24,15 @@ SOUTHERN_PRICING_SAMPLE_URL = os.getenv(
 )
 SOUTHERN_USERNAME = os.getenv("SOUTHERN_USERNAME", "")
 SOUTHERN_PASSWORD = os.getenv("SOUTHERN_PASSWORD", "")
+
+# Mixed-category test sources. Override any URL in Render if Southern changes its taxonomy.
+MIXED_CATEGORY_URLS = {
+    "food": os.getenv("SOUTHERN_FOOD_URL", "https://www.southernpetsupplies.com.au/category/dog-products/dog-food/"),
+    "toys": os.getenv("SOUTHERN_TOYS_URL", "https://www.southernpetsupplies.com.au/category/dog-products/dog-toys/"),
+    "bedding": os.getenv("SOUTHERN_BEDDING_URL", "https://www.southernpetsupplies.com.au/category/dog-products/dog-beds-bedding/"),
+    "grooming": os.getenv("SOUTHERN_GROOMING_URL", "https://www.southernpetsupplies.com.au/category/dog-products/grooming-products/"),
+    "health": os.getenv("SOUTHERN_HEALTH_URL", "https://www.southernpetsupplies.com.au/category/dog-health-products/?orderby=popularity"),
+}
 
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() in {"1","true","yes","on"}
 
@@ -863,13 +872,114 @@ async def serp_final_rows(limit:int=5):
     return final
 
 
+
+async def mixed_price_rows(per_category:int=4):
+    """
+    Read a small balanced sample from five Southern categories.
+    This keeps the commercial test representative without consuming excessive SerpApi quota.
+    """
+    per_category = min(max(per_category,1),6)
+    client = await southern_authenticated_client()
+    out = []
+    try:
+        for category, url in MIXED_CATEGORY_URLS.items():
+            r = await client.get(url)
+            if r.status_code >= 400:
+                continue
+            rows = parse_southern_products(r.text, per_category)
+            for row in rows:
+                out.append({**row, "source_category": category, "source_url": str(r.url)})
+    finally:
+        await client.aclose()
+    return out
+
+async def commercial_rows_from_price_rows(price_rows):
+    _, stock_text = await fetch_csv_or_discover(SOUTHERN_STOCK_URL)
+    _, stock_rows = parse_delimited(stock_text)
+    smap = stock_map(stock_rows)
+
+    _, gtin_text = await fetch_csv_or_discover(SOUTHERN_GTIN_URL)
+    _, gtin_rows = parse_delimited(gtin_text)
+    gmap = gtin_map(gtin_rows)
+
+    out = []
+    for p in price_rows:
+        sku = p["sku"]
+        g = gmap.get(sku, {})
+        product = g.get("product_name") or p.get("title") or sku
+        product = clean_title(product, sku)
+        weight = g.get("weight") or p.get("page_weight")
+        weight_kg = parse_weight_kg(weight)
+        stock = smap.get(sku, 0)
+        calc = commercial_calc(float(p["active_cost_ex_gst"]), weight_kg, product)
+
+        hold=[]
+        if stock <= 0:
+            hold.append("supplier_stock")
+        if not calc["passes_margin"]:
+            hold.append("margin")
+
+        out.append({
+            "sku": sku,
+            "product": product,
+            "source_category": p.get("source_category"),
+            "southern_cost_ex_gst": p["active_cost_ex_gst"],
+            "former_cost_ex_gst": p.get("former_cost_ex_gst"),
+            "stock": stock,
+            "gtin": g.get("gtin"),
+            "weight": weight,
+            **calc,
+            "status": "LIVE" if not hold else "OUT_OF_STOCK",
+            "hold_reason": hold,
+        })
+    return out
+
+async def mixed_serp_final_rows(per_category:int=4):
+    price_rows = await mixed_price_rows(per_category)
+    commercial = await commercial_rows_from_price_rows(price_rows)
+    final = []
+
+    # One SerpApi benchmark per product. Caller controls sample size.
+    for r in commercial:
+        market = await live_market_for_product(r)
+        required = r["proposed_price"]
+        hold = list(r.get("hold_reason") or [])
+
+        if r["stock"] <= 0:
+            final_status = "TEMP_OUT_OF_STOCK"
+        elif not r["passes_margin"]:
+            final_status = "COMMERCIAL_HOLD"
+            hold.append("margin")
+        elif not market["verified"]:
+            final_status = "REVIEW_MARKET"
+            hold.append("market_unverified")
+        elif required > market["market_ceiling"]:
+            final_status = "COMMERCIAL_HOLD"
+            hold.append("market_price")
+        else:
+            final_status = "APPROVED_DRAFT"
+
+        final.append({
+            **r,
+            "market_queries": market.get("queries") or [market.get("query")],
+            "market_verified": market["verified"],
+            "market_offer_count": market["offer_count"],
+            "market_benchmark": market["benchmark_price"],
+            "market_ceiling": market["market_ceiling"],
+            "market_offers": market["offers"],
+            "final_status": final_status,
+            "hold_reason": list(dict.fromkeys(hold)),
+        })
+    return final
+
+
 @app.get("/")
 async def root():
     return {
         "service": APP_NAME, "status":"running", "version":VERSION, "dry_run":DRY_RUN,
         "next":["/health","/shopify/test","/southern/stock-preview","/southern/gtin-preview",
                 "/southern/login-test","/southern/pricing-preview","/southern/commercial-preview",
-                "/southern/commercial-table","/market/benchmark-preview","/southern/final-commercial-table","/market/serpapi-test","/southern/serp-commercial-table"]
+                "/southern/commercial-table","/market/benchmark-preview","/southern/final-commercial-table","/market/serpapi-test","/southern/serp-commercial-table","/southern/mixed-market-table"]
     }
 
 @app.get("/health")
@@ -1154,6 +1264,88 @@ async def serp_commercial_table(limit:int=5):
     <th>Stock</th><th>Required Price</th><th>Lowest accepted offers</th>
     <th>Benchmark</th><th>Ceiling</th><th>Margin</th><th>Status</th></tr></thead>
     <tbody>{''.join(trs)}</tbody></table></body></html>
+    """
+    return HTMLResponse(html)
+
+
+
+@app.get("/southern/mixed-market-preview")
+async def mixed_market_preview(per_category:int=4):
+    # Maximum 20 products by default; hard cap 30.
+    per_category = min(max(per_category,1),6)
+    rows = await mixed_serp_final_rows(per_category)
+    summary = {}
+    for r in rows:
+        cat = r.get("source_category") or "unknown"
+        summary.setdefault(cat, {"APPROVED_DRAFT":0,"COMMERCIAL_HOLD":0,"TEMP_OUT_OF_STOCK":0,"REVIEW_MARKET":0})
+        summary[cat][r["final_status"]] = summary[cat].get(r["final_status"],0) + 1
+    return {
+        "ok": True,
+        "dry_run": DRY_RUN,
+        "count": len(rows),
+        "summary_by_category": summary,
+        "rows": rows,
+        "note": "Mixed-category SerpApi dry run. No Shopify changes."
+    }
+
+@app.get("/southern/mixed-market-table", response_class=HTMLResponse)
+async def mixed_market_table(per_category:int=4):
+    per_category = min(max(per_category,1),6)
+    rows = await mixed_serp_final_rows(per_category)
+
+    summary = {}
+    for r in rows:
+        cat = r.get("source_category") or "unknown"
+        summary.setdefault(cat, {"APPROVED_DRAFT":0,"COMMERCIAL_HOLD":0,"TEMP_OUT_OF_STOCK":0,"REVIEW_MARKET":0})
+        summary[cat][r["final_status"]] = summary[cat].get(r["final_status"],0) + 1
+
+    summary_html = "".join(
+        f"<div class='card'><b>{cat.title()}</b><br>"
+        f"Approved: {vals.get('APPROVED_DRAFT',0)} &nbsp; "
+        f"Hold: {vals.get('COMMERCIAL_HOLD',0)} &nbsp; "
+        f"Stockout: {vals.get('TEMP_OUT_OF_STOCK',0)} &nbsp; "
+        f"Review: {vals.get('REVIEW_MARKET',0)}</div>"
+        for cat, vals in summary.items()
+    )
+
+    trs=[]
+    for r in rows:
+        offers="<br>".join(
+            f"{o.get('retailer')}: ${o.get('price'):.2f}"
+            for o in r.get("market_offers",[])[:3]
+        ) or "—"
+        bench = "—" if r["market_benchmark"] is None else f"${r['market_benchmark']:.2f}"
+        ceiling = "—" if r["market_ceiling"] is None else f"${r['market_ceiling']:.2f}"
+        trs.append(
+            f"<tr><td>{r['source_category']}</td><td>{r['sku']}</td><td>{r['product']}</td>"
+            f"<td>${r['southern_cost_ex_gst']:.2f}</td><td>{r['stock']}</td>"
+            f"<td>${r['proposed_price']:.2f}</td><td>{offers}</td>"
+            f"<td>{bench}</td><td>{ceiling}</td><td>{r['margin_rate']*100:.1f}%</td>"
+            f"<td><b>{r['final_status']}</b></td></tr>"
+        )
+
+    html=f"""
+    <html><head><title>PawVida Mixed Category Market Test</title>
+    <style>
+    body{{font-family:Arial,sans-serif;margin:26px;color:#1f2d22}}
+    h1{{margin-bottom:4px}}
+    .note{{padding:12px;background:#f3f6ef;border-radius:8px;margin:14px 0}}
+    .summary{{display:flex;gap:10px;flex-wrap:wrap;margin:15px 0}}
+    .card{{background:#eef4ed;border-radius:8px;padding:12px 14px;min-width:190px}}
+    table{{border-collapse:collapse;width:100%;font-size:12px}}
+    th,td{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}
+    th{{background:#eef4ed;position:sticky;top:0}}
+    </style></head><body>
+    <h1>PawVida — Mixed Category Market Test</h1>
+    <div class="note">Dry run. {len(rows)} products across food, toys, bedding, grooming and health.
+    No Shopify changes.</div>
+    <div class="summary">{summary_html}</div>
+    <table><thead><tr>
+    <th>Category</th><th>SKU</th><th>Product</th><th>Southern Cost ex GST</th>
+    <th>Stock</th><th>Required Price</th><th>Lowest accepted offers</th>
+    <th>Benchmark</th><th>Ceiling</th><th>Margin</th><th>Status</th>
+    </tr></thead><tbody>{''.join(trs)}</tbody></table>
+    </body></html>
     """
     return HTMLResponse(html)
 
