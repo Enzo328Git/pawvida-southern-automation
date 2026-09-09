@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "PawVida Southern Automation"
-VERSION = "4.0.0"
+VERSION = "5.0.0"
 
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "pawvida-6")
@@ -47,6 +47,22 @@ DEFAULT_CUSTOMER_SHIPPING = float(os.getenv("DEFAULT_CUSTOMER_SHIPPING", "9.95")
 MARKET_BENCHMARK_CSV_URL = os.getenv("MARKET_BENCHMARK_CSV_URL", "")
 MARKET_CEILING_MULTIPLIER = float(os.getenv("MARKET_CEILING_MULTIPLIER", "1.03"))
 MIN_BENCHMARK_OFFERS = int(os.getenv("MIN_BENCHMARK_OFFERS", "3"))
+
+# Live Google Shopping benchmark via SerpApi.
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", "")
+SERPAPI_LOCATION = os.getenv("SERPAPI_LOCATION", "Sydney, New South Wales, Australia")
+SERPAPI_GL = os.getenv("SERPAPI_GL", "au")
+SERPAPI_HL = os.getenv("SERPAPI_HL", "en")
+
+# Exclude marketplace-style sources from automatic commercial approval by default.
+MARKETPLACE_BLOCKLIST = {
+    x.strip().lower() for x in os.getenv(
+        "MARKETPLACE_BLOCKLIST",
+        "ebay,temu,aliexpress,catch"
+    ).split(",") if x.strip()
+}
+
+_serp_cache = {}
 
 app = FastAPI(title=APP_NAME, version=VERSION)
 _token_cache: dict[str, Any] = {"token": None, "expires_at": 0}
@@ -515,13 +531,194 @@ async def final_commercial_rows(limit:int=50):
     return final
 
 
+
+def normalize_product_text(value: str | None) -> str:
+    s = (value or "").lower()
+    s = s.replace("&", " and ")
+    s = re.sub(r"[^a-z0-9.]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def pack_tokens(value: str | None):
+    s = normalize_product_text(value)
+    # capture sizes such as 13kg, 2.5kg, 500g, 250ml
+    return set(re.findall(r"\b\d+(?:\.\d+)?\s*(?:kg|g|ml|l)\b", s))
+
+def token_similarity(a: str, b: str) -> float:
+    aa = {x for x in normalize_product_text(a).split() if len(x) > 1}
+    bb = {x for x in normalize_product_text(b).split() if len(x) > 1}
+    if not aa or not bb:
+        return 0.0
+    return len(aa & bb) / max(1, len(aa | bb))
+
+def source_blocked(source: str | None) -> bool:
+    s = normalize_product_text(source)
+    return any(block in s for block in MARKETPLACE_BLOCKLIST)
+
+async def serpapi_shopping_search(query: str):
+    if not SERPAPI_API_KEY:
+        raise HTTPException(500, "SERPAPI_API_KEY is not configured")
+    cache_key = (query, SERPAPI_LOCATION, SERPAPI_GL)
+    cached = _serp_cache.get(cache_key)
+    if cached and time.time() - cached["ts"] < 3600:
+        return cached["data"]
+
+    params = {
+        "engine": "google_shopping",
+        "q": query,
+        "gl": SERPAPI_GL,
+        "hl": SERPAPI_HL,
+        "location": SERPAPI_LOCATION,
+        "api_key": SERPAPI_API_KEY,
+        "output": "json",
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.get("https://serpapi.com/search", params=params)
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, f"SerpApi request failed: {r.text[:500]}")
+    data = r.json()
+    if data.get("error"):
+        raise HTTPException(502, f"SerpApi error: {data['error']}")
+    _serp_cache[cache_key] = {"ts": time.time(), "data": data}
+    return data
+
+def filter_serp_offers(product_row, shopping_results):
+    product_name = product_row.get("product") or ""
+    gtin = str(product_row.get("gtin") or "").strip()
+    wanted_sizes = pack_tokens(product_name)
+    offers = []
+
+    for item in shopping_results or []:
+        source = item.get("source") or ""
+        if source_blocked(source):
+            continue
+        title = item.get("title") or ""
+        raw_price = item.get("extracted_price")
+        if raw_price is None:
+            raw = str(item.get("price") or "").replace("$","").replace(",","").strip()
+            try:
+                raw_price = float(raw)
+            except Exception:
+                continue
+        try:
+            price = float(raw_price)
+        except Exception:
+            continue
+        if price <= 0:
+            continue
+
+        result_sizes = pack_tokens(title)
+        if wanted_sizes and result_sizes and not (wanted_sizes & result_sizes):
+            continue
+
+        similarity = token_similarity(product_name, title)
+
+        # GTIN searches are usually highly precise; title fallback needs stronger similarity.
+        match_type = "GTIN_QUERY" if gtin else "TITLE_QUERY"
+        min_sim = 0.18 if gtin else 0.42
+        if similarity < min_sim:
+            continue
+
+        offers.append({
+            "retailer": source,
+            "price": round(price,2),
+            "title": title,
+            "url": item.get("product_link"),
+            "position": item.get("position"),
+            "match_type": match_type,
+            "similarity": round(similarity,3),
+            "delivery": item.get("delivery"),
+        })
+
+    # de-dupe exact same retailer/price/title
+    dedup={}
+    for o in offers:
+        dedup[(o["retailer"],o["price"],o["title"])]=o
+    offers=list(dedup.values())
+    offers.sort(key=lambda x:x["price"])
+    return offers
+
+async def live_market_for_product(product_row):
+    gtin = str(product_row.get("gtin") or "").strip()
+    name = product_row.get("product") or product_row.get("sku")
+    query = gtin if gtin else name
+    data = await serpapi_shopping_search(query)
+    offers = filter_serp_offers(product_row, data.get("shopping_results") or [])
+
+    # require distinct credible retailers
+    distinct=[]
+    seen=set()
+    for o in offers:
+        retailer=(o.get("retailer") or "").lower()
+        if retailer in seen:
+            continue
+        seen.add(retailer)
+        distinct.append(o)
+
+    if len(distinct) < MIN_BENCHMARK_OFFERS:
+        return {
+            "verified": False,
+            "query": query,
+            "offer_count": len(distinct),
+            "offers": distinct[:10],
+            "benchmark_price": None,
+            "market_ceiling": None,
+        }
+
+    lowest = distinct[:3]
+    prices=sorted(o["price"] for o in lowest)
+    benchmark=prices[1]
+    ceiling=round(benchmark * MARKET_CEILING_MULTIPLIER,2)
+    return {
+        "verified": True,
+        "query": query,
+        "offer_count": len(distinct),
+        "offers": distinct[:10],
+        "benchmark_price": round(benchmark,2),
+        "market_ceiling": ceiling,
+    }
+
+async def serp_final_rows(limit:int=5):
+    rows = await commercial_rows(limit)
+    final=[]
+    for r in rows:
+        market = await live_market_for_product(r)
+        required=r["proposed_price"]
+        hold=list(r.get("hold_reason") or [])
+        if r["stock"] <= 0:
+            status="TEMP_OUT_OF_STOCK"
+        elif not r["passes_margin"]:
+            status="COMMERCIAL_HOLD"
+            hold.append("margin")
+        elif not market["verified"]:
+            status="REVIEW_MARKET"
+            hold.append("market_unverified")
+        elif required > market["market_ceiling"]:
+            status="COMMERCIAL_HOLD"
+            hold.append("market_price")
+        else:
+            status="APPROVED_DRAFT"
+        final.append({
+            **r,
+            "market_query": market["query"],
+            "market_verified": market["verified"],
+            "market_offer_count": market["offer_count"],
+            "market_benchmark": market["benchmark_price"],
+            "market_ceiling": market["market_ceiling"],
+            "market_offers": market["offers"],
+            "final_status": status,
+            "hold_reason": list(dict.fromkeys(hold)),
+        })
+    return final
+
+
 @app.get("/")
 async def root():
     return {
         "service": APP_NAME, "status":"running", "version":VERSION, "dry_run":DRY_RUN,
         "next":["/health","/shopify/test","/southern/stock-preview","/southern/gtin-preview",
                 "/southern/login-test","/southern/pricing-preview","/southern/commercial-preview",
-                "/southern/commercial-table","/market/benchmark-preview","/southern/final-commercial-table"]
+                "/southern/commercial-table","/market/benchmark-preview","/southern/final-commercial-table","/market/serpapi-test","/southern/serp-commercial-table"]
     }
 
 @app.get("/health")
@@ -728,6 +925,84 @@ async def final_commercial_table(limit:int=50):
     <th>Market Ceiling</th><th>Contribution</th><th>Margin</th><th>Status</th></tr></thead>
     <tbody>{''.join(trs)}</tbody></table>
     </body></html>
+    """
+    return HTMLResponse(html)
+
+
+
+@app.get("/market/serpapi-test")
+async def market_serpapi_test(q:str="Advance Adult Dog All Breed Active 13kg"):
+    data = await serpapi_shopping_search(q)
+    results = data.get("shopping_results") or []
+    return {
+        "ok": True,
+        "query": q,
+        "result_count": len(results),
+        "sample": [{
+            "title": x.get("title"),
+            "source": x.get("source"),
+            "price": x.get("extracted_price") or x.get("price"),
+            "product_link": x.get("product_link"),
+        } for x in results[:10]],
+        "note": "One SerpApi Google Shopping Australia search. No Shopify changes."
+    }
+
+@app.get("/southern/serp-commercial-preview")
+async def serp_commercial_preview(limit:int=5):
+    # Limit is intentionally capped during testing to protect API quota.
+    limit=min(max(limit,1),10)
+    rows=await serp_final_rows(limit)
+    return {
+        "ok":True,
+        "dry_run":DRY_RUN,
+        "count":len(rows),
+        "rows":rows,
+        "policy":{
+            "country":SERPAPI_GL,
+            "location":SERPAPI_LOCATION,
+            "minimum_distinct_retailers":MIN_BENCHMARK_OFFERS,
+            "benchmark":"median of 3 lowest accepted distinct-retailer Google Shopping offers",
+            "market_ceiling_multiplier":MARKET_CEILING_MULTIPLIER,
+            "marketplace_blocklist":sorted(MARKETPLACE_BLOCKLIST),
+        },
+        "note":"Testing cap: 10 products per request. No Shopify changes."
+    }
+
+@app.get("/southern/serp-commercial-table", response_class=HTMLResponse)
+async def serp_commercial_table(limit:int=5):
+    limit=min(max(limit,1),10)
+    rows=await serp_final_rows(limit)
+    trs=[]
+    for r in rows:
+        bp="—" if r["market_benchmark"] is None else f"${r['market_benchmark']:.2f}"
+        mc="—" if r["market_ceiling"] is None else f"${r['market_ceiling']:.2f}"
+        offer_text="<br>".join(
+            f"{o['retailer']}: ${o['price']:.2f}"
+            for o in r.get("market_offers",[])[:3]
+        ) or "—"
+        trs.append(
+            f"<tr><td>{r['sku']}</td><td>{r['product']}</td>"
+            f"<td>${r['southern_cost_ex_gst']:.2f}</td><td>{r['stock']}</td>"
+            f"<td>${r['proposed_price']:.2f}</td><td>{offer_text}</td>"
+            f"<td>{bp}</td><td>{mc}</td><td>{r['margin_rate']*100:.1f}%</td>"
+            f"<td><b>{r['final_status']}</b></td></tr>"
+        )
+    html=f"""
+    <html><head><title>PawVida Live Market Test</title>
+    <style>
+    body{{font-family:Arial,sans-serif;margin:28px;color:#1f2d22}}
+    table{{border-collapse:collapse;width:100%;font-size:13px}}
+    th,td{{border-bottom:1px solid #ddd;padding:9px;text-align:left;vertical-align:top}}
+    th{{background:#eef4ed;position:sticky;top:0}}
+    .note{{padding:12px;background:#f3f6ef;border-radius:8px;margin:16px 0}}
+    </style></head><body>
+    <h1>PawVida — Live Market Benchmark Test</h1>
+    <div class="note">Dry run. Limited to {limit} products to protect SerpApi quota.
+    No Shopify changes.</div>
+    <table><thead><tr><th>SKU</th><th>Product</th><th>Southern Cost ex GST</th>
+    <th>Stock</th><th>Required Price</th><th>Lowest accepted offers</th>
+    <th>Benchmark</th><th>Ceiling</th><th>Margin</th><th>Status</th></tr></thead>
+    <tbody>{''.join(trs)}</tbody></table></body></html>
     """
     return HTMLResponse(html)
 
