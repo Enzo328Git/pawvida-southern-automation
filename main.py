@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "PawVida Southern Automation"
-VERSION = "8.0.0"
+VERSION = "9.0.0"
 
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "pawvida-6")
@@ -49,6 +49,9 @@ RETURNS_ALLOWANCE_RATE = 0.005
 FREE_SHIPPING_THRESHOLD = float(os.getenv("FREE_SHIPPING_THRESHOLD", "99"))
 MAX_FREIGHT_SUBSIDY = float(os.getenv("MAX_FREIGHT_SUBSIDY", "6"))
 DEFAULT_CUSTOMER_SHIPPING = float(os.getenv("DEFAULT_CUSTOMER_SHIPPING", "9.95"))
+MINIMUM_ORDER_VALUE = float(os.getenv("MINIMUM_ORDER_VALUE", "39"))
+TARGET_BASKET_CONTRIBUTION = float(os.getenv("TARGET_BASKET_CONTRIBUTION", "12"))
+
 
 # Competitor benchmark source.
 # Expected CSV columns:
@@ -345,19 +348,43 @@ def parse_weight_kg(value):
     except Exception:
         return None
 
+
 def category_rule(product_name: str):
+    """
+    Category characteristics. Margin floors here are secondary to retail-price bands.
+    """
     n = product_name.lower()
     if any(x in n for x in ["coat", "jacket", "clothing", "jumper"]):
-        return {"name":"clothing", "min_margin_rate":0.28, "min_contribution":15.0, "returns_rate":0.03}
+        return {"name":"clothing", "category_margin_floor":0.24, "returns_rate":0.03}
     if any(x in n for x in ["bed", "bedding", "mattress"]):
-        return {"name":"bedding", "min_margin_rate":0.30, "min_contribution":18.0, "returns_rate":0.0075}
-    if any(x in n for x in ["toy", "kong", "ball", "chew"]):
-        return {"name":"toys", "min_margin_rate":0.28, "min_contribution":10.0, "returns_rate":0.005}
+        return {"name":"bedding", "category_margin_floor":0.24, "returns_rate":0.0075}
+    if any(x in n for x in ["toy", "kong", "ball", "chew", "benebone", "chuckit"]):
+        return {"name":"toys", "category_margin_floor":0.20, "returns_rate":0.005}
     if any(x in n for x in ["lead", "leash", "harness", "collar", "walking"]):
-        return {"name":"walking", "min_margin_rate":0.28, "min_contribution":12.0, "returns_rate":0.0075}
+        return {"name":"walking", "category_margin_floor":0.22, "returns_rate":0.0075}
     if any(x in n for x in ["food", "kibble", "adult dog", "puppy", "cat food", "diet"]):
-        return {"name":"mainstream_food", "min_margin_rate":0.18, "min_contribution":10.0, "returns_rate":0.005}
-    return {"name":"general", "min_margin_rate":0.24, "min_contribution":10.0, "returns_rate":0.005}
+        return {"name":"mainstream_food", "category_margin_floor":0.16, "returns_rate":0.005}
+    if any(x in n for x in ["groom", "clipper", "comb", "brush", "shampoo", "conditioner", "blade care", "clipper oil"]):
+        return {"name":"grooming", "category_margin_floor":0.18, "returns_rate":0.005}
+    if any(x in n for x in ["supplement", "health", "immune", "vitamin", "joint", "skin", "care"]):
+        return {"name":"health", "category_margin_floor":0.20, "returns_rate":0.0075}
+    return {"name":"general", "category_margin_floor":0.20, "returns_rate":0.005}
+
+def retail_band_rule(retail_price: float):
+    """
+    Basket-aware SKU economics.
+    Low-value products only need modest absolute contribution because basket profitability
+    and minimum-order rules carry the order-level economics.
+    """
+    if retail_price < 15:
+        return {"min_contribution":2.00, "min_margin_rate":0.18}
+    if retail_price < 30:
+        return {"min_contribution":3.50, "min_margin_rate":0.20}
+    if retail_price < 60:
+        return {"min_contribution":6.00, "min_margin_rate":0.22}
+    if retail_price < 100:
+        return {"min_contribution":10.00, "min_margin_rate":0.24}
+    return {"min_contribution":15.00, "min_margin_rate":0.18}
 
 def estimate_freight_subsidy(weight_kg):
     # Avoid embedding full freight in unit price. Customer pays shipping below threshold.
@@ -379,36 +406,63 @@ def round_95(x: float) -> float:
         candidate = whole + 1.95
     return round(candidate, 2)
 
+
 def commercial_calc(cost_ex_gst, weight_kg, product_name):
     rule = category_rule(product_name)
     cost_inc_gst = cost_ex_gst * (1 + DEFAULT_GST)
     freight_subsidy = estimate_freight_subsidy(weight_kg)
 
-    # Find the lowest retail price that passes both $ contribution and % margin.
-    test_price = max(cost_inc_gst + 1, 9.95)
+    # Search for the lowest retail price that clears:
+    # 1) no-loss SKU economics
+    # 2) retail-price-band contribution
+    # 3) greater of band margin floor and category floor
+    test_price = max(cost_inc_gst + 0.50, 4.95)
     found = None
-    for cents in range(int(test_price*100), int((test_price*2.5 + 150)*100), 5):
+    found_rule = None
+
+    upper = max(test_price * 3.0, test_price + 120)
+    cents = int(test_price * 100)
+    max_cents = int(upper * 100)
+
+    while cents <= max_cents:
         p = cents / 100.0
+        band = retail_band_rule(p)
+        min_margin = max(band["min_margin_rate"], rule["category_margin_floor"])
+
         payment_fee = p * PAYMENT_FEE_RATE + PAYMENT_FEE_FIXED
         returns_allowance = p * rule["returns_rate"]
         contribution = p - cost_inc_gst - freight_subsidy - payment_fee - returns_allowance
         margin_rate = contribution / p if p else 0
-        if contribution >= rule["min_contribution"] and margin_rate >= rule["min_margin_rate"]:
+
+        if contribution >= band["min_contribution"] and margin_rate >= min_margin:
             found = p
+            found_rule = {**band, "min_margin_rate":min_margin}
             break
+        cents += 5
+
     if found is None:
-        found = cost_inc_gst * 1.5
+        found = cost_inc_gst * 1.4
+        band = retail_band_rule(found)
+        found_rule = {
+            **band,
+            "min_margin_rate":max(band["min_margin_rate"], rule["category_margin_floor"])
+        }
 
     proposed = round_95(found)
+    band = retail_band_rule(proposed)
+    min_margin = max(band["min_margin_rate"], rule["category_margin_floor"])
     payment_fee = proposed * PAYMENT_FEE_RATE + PAYMENT_FEE_FIXED
     returns_allowance = proposed * rule["returns_rate"]
     contribution = proposed - cost_inc_gst - freight_subsidy - payment_fee - returns_allowance
     margin_rate = contribution / proposed if proposed else 0
+    passes = contribution >= band["min_contribution"] and margin_rate >= min_margin and contribution > 0
 
     return {
         "category_rule": rule["name"],
-        "min_margin_rate": rule["min_margin_rate"],
-        "min_contribution": rule["min_contribution"],
+        "category_margin_floor": rule["category_margin_floor"],
+        "price_band_min_margin": band["min_margin_rate"],
+        "min_margin_rate": min_margin,
+        "min_contribution": band["min_contribution"],
         "southern_cost_ex_gst": round(cost_ex_gst,2),
         "cost_inc_gst": round(cost_inc_gst,2),
         "freight_subsidy": round(freight_subsidy,2),
@@ -417,671 +471,9 @@ def commercial_calc(cost_ex_gst, weight_kg, product_name):
         "proposed_price": proposed,
         "contribution": round(contribution,2),
         "margin_rate": round(margin_rate,4),
-        "passes_margin": contribution >= rule["min_contribution"] and margin_rate >= rule["min_margin_rate"],
+        "passes_margin": passes,
+        "basket_model": True,
     }
-
-
-async def load_market_benchmarks():
-    """
-    Loads an externally maintained competitor benchmark CSV.
-    This keeps competitor acquisition separate from pricing decisions and makes every
-    benchmark auditable by retailer, URL, timestamp and match type.
-    """
-    if not MARKET_BENCHMARK_CSV_URL:
-        return []
-    _, text = await fetch_csv_or_discover(MARKET_BENCHMARK_CSV_URL)
-    _, rows = parse_delimited(text)
-    cleaned = []
-    for r in rows:
-        sku = str(r.get("sku") or r.get("SKU") or "").strip()
-        gtin = str(r.get("gtin") or r.get("GTIN") or "").strip()
-        retailer = str(r.get("retailer") or r.get("Retailer") or "").strip()
-        product = str(r.get("product") or r.get("Product") or "").strip()
-        url = str(r.get("url") or r.get("URL") or "").strip()
-        checked_at = str(r.get("checked_at") or r.get("Checked At") or "").strip()
-        match_type = str(r.get("match_type") or r.get("Match Type") or "").strip() or None
-        raw_price = str(r.get("price") or r.get("Price") or "").replace("$","").replace(",","").strip()
-        raw_stock = str(r.get("in_stock") or r.get("In Stock") or "true").strip().lower()
-        try:
-            price = float(raw_price)
-        except Exception:
-            continue
-        in_stock = raw_stock in {"1","true","yes","y","in stock","available"}
-        if price <= 0 or not in_stock:
-            continue
-        cleaned.append({
-            "sku": sku or None,
-            "gtin": gtin or None,
-            "product": product or None,
-            "retailer": retailer or None,
-            "price": round(price,2),
-            "url": url or None,
-            "checked_at": checked_at or None,
-            "match_type": match_type,
-            "in_stock": True,
-        })
-    return cleaned
-
-def market_for_product(product_row, offers):
-    """
-    Match benchmark rows by exact GTIN first, then exact SKU.
-    Fuzzy title matching is deliberately excluded from automatic approval.
-    """
-    gtin = str(product_row.get("gtin") or "").strip()
-    sku = str(product_row.get("sku") or "").strip()
-    matches = []
-    for o in offers:
-        if gtin and o.get("gtin") and o["gtin"] == gtin:
-            matches.append({**o, "effective_match":"GTIN"})
-        elif sku and o.get("sku") and o["sku"].upper() == sku.upper():
-            matches.append({**o, "effective_match":"SKU"})
-    # dedupe same retailer + price + URL
-    dedup = {}
-    for o in matches:
-        key=(o.get("retailer"),o.get("price"),o.get("url"))
-        dedup[key]=o
-    matches=list(dedup.values())
-    matches.sort(key=lambda x:x["price"])
-    credible = matches[:max(MIN_BENCHMARK_OFFERS,3)]
-    if len(credible) < MIN_BENCHMARK_OFFERS:
-        return {
-            "verified": False,
-            "offer_count": len(matches),
-            "offers": matches,
-            "benchmark_price": None,
-            "market_ceiling": None,
-        }
-    # median of the three lowest credible offers
-    sample = credible[:3]
-    prices = sorted([x["price"] for x in sample])
-    median = prices[len(prices)//2]
-    ceiling = round(median * MARKET_CEILING_MULTIPLIER, 2)
-    return {
-        "verified": True,
-        "offer_count": len(matches),
-        "offers": matches,
-        "benchmark_price": round(median,2),
-        "market_ceiling": ceiling,
-    }
-
-async def final_commercial_rows(limit:int=50):
-    rows = await commercial_rows(limit)
-    offers = await load_market_benchmarks()
-    final=[]
-    for r in rows:
-        market = market_for_product(r, offers)
-        required = r["proposed_price"]
-        final_status = None
-        hold = list(r.get("hold_reason") or [])
-        if r["stock"] <= 0:
-            final_status = "TEMP_OUT_OF_STOCK"
-        elif not r["passes_margin"]:
-            final_status = "COMMERCIAL_HOLD"
-            if "margin" not in hold:
-                hold.append("margin")
-        elif not market["verified"]:
-            final_status = "REVIEW_MARKET"
-            hold.append("market_unverified")
-        elif required > market["market_ceiling"]:
-            final_status = "COMMERCIAL_HOLD"
-            hold.append("market_price")
-        else:
-            final_status = "APPROVED_DRAFT"
-        final.append({
-            **r,
-            "market_verified": market["verified"],
-            "market_offer_count": market["offer_count"],
-            "market_benchmark": market["benchmark_price"],
-            "market_ceiling": market["market_ceiling"],
-            "market_offers": market["offers"],
-            "final_status": final_status,
-            "hold_reason": hold,
-        })
-    return final
-
-
-
-def normalize_product_text(value: str | None) -> str:
-    s = (value or "").lower()
-    s = s.replace("&", " and ")
-    s = re.sub(r"[^a-z0-9.]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def pack_tokens(value: str | None):
-    s = normalize_product_text(value)
-    # capture sizes such as 13kg, 2.5kg, 500g, 250ml
-    return set(re.findall(r"\b\d+(?:\.\d+)?\s*(?:kg|g|ml|l)\b", s))
-
-def token_similarity(a: str, b: str) -> float:
-    aa = {x for x in normalize_product_text(a).split() if len(x) > 1}
-    bb = {x for x in normalize_product_text(b).split() if len(x) > 1}
-    if not aa or not bb:
-        return 0.0
-    return len(aa & bb) / max(1, len(aa | bb))
-
-def source_blocked(source: str | None) -> bool:
-    s = normalize_product_text(source)
-    return any(block in s for block in MARKETPLACE_BLOCKLIST)
-
-async def serpapi_shopping_search(query: str):
-    if not SERPAPI_API_KEY:
-        raise HTTPException(500, "SERPAPI_API_KEY is not configured")
-    cache_key = (query, SERPAPI_LOCATION, SERPAPI_GL)
-    cached = _serp_cache.get(cache_key)
-    if cached and time.time() - cached["ts"] < 3600:
-        return cached["data"]
-
-    params = {
-        "engine": "google_shopping",
-        "q": query,
-        "gl": SERPAPI_GL,
-        "hl": SERPAPI_HL,
-        "location": SERPAPI_LOCATION,
-        "api_key": SERPAPI_API_KEY,
-        "output": "json",
-    }
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get("https://serpapi.com/search", params=params)
-    if r.status_code >= 400:
-        raise HTTPException(r.status_code, f"SerpApi request failed: {r.text[:500]}")
-    data = r.json()
-    if data.get("error"):
-        raise HTTPException(502, f"SerpApi error: {data['error']}")
-    _serp_cache[cache_key] = {"ts": time.time(), "data": data}
-    return data
-
-
-def numeric_pack_signature(value: str | None):
-    s = normalize_product_text(value)
-    sig = []
-    for num, unit in re.findall(r"\b(\d+(?:\.\d+)?)\s*(kg|g|ml|l)\b", s):
-        try:
-            n = float(num)
-        except Exception:
-            continue
-        # normalize kg/g and l/ml
-        if unit == "kg":
-            sig.append(("mass_g", round(n*1000,1)))
-        elif unit == "g":
-            sig.append(("mass_g", round(n,1)))
-        elif unit == "l":
-            sig.append(("volume_ml", round(n*1000,1)))
-        elif unit == "ml":
-            sig.append(("volume_ml", round(n,1)))
-    return sig
-
-def pack_match(product_name: str, result_title: str) -> bool:
-    wanted = numeric_pack_signature(product_name)
-    found = numeric_pack_signature(result_title)
-    if not wanted:
-        return True
-    if not found:
-        # Missing pack size is not enough for auto-approval
-        return False
-    for wu, wv in wanted:
-        for fu, fv in found:
-            if wu == fu and abs(wv-fv) <= max(1.0, wv*0.02):
-                return True
-    return False
-
-def brand_tokens(value: str | None):
-    s = normalize_product_text(value)
-    # first meaningful token is usually brand on these catalogue titles
-    toks = [x for x in s.split() if len(x) > 2 and not x.isdigit()]
-    return toks[:2]
-
-def core_title_tokens(value: str | None):
-    stop = {
-        "adult","dog","dogs","cat","cats","food","dry","with","and","the","for",
-        "kg","g","ml","l","all","breed","breeds","original","current","price","was"
-    }
-    toks = []
-    for x in normalize_product_text(value).split():
-        if x in stop or re.fullmatch(r"\d+(?:\.\d+)?", x):
-            continue
-        if len(x) > 2:
-            toks.append(x)
-    return set(toks)
-
-def offer_plausible(product_row, item) -> tuple[bool, str]:
-    title = item.get("title") or ""
-    source = item.get("source") or ""
-    if source_blocked(source):
-        return False, "blocked_source"
-
-    if not pack_match(product_row.get("product") or "", title):
-        return False, "pack_mismatch"
-
-    p_tokens = core_title_tokens(product_row.get("product") or "")
-    r_tokens = core_title_tokens(title)
-    if not p_tokens or not r_tokens:
-        return False, "weak_title"
-
-    overlap = len(p_tokens & r_tokens)
-    # Require at least 2 meaningful shared tokens, or 1 if very short title.
-    if overlap < (1 if len(p_tokens) <= 2 else 2):
-        return False, "title_mismatch"
-
-    # Brand consistency: first meaningful token should appear in result.
-    brands = brand_tokens(product_row.get("product") or "")
-    if brands and brands[0] not in normalize_product_text(title).split():
-        return False, "brand_mismatch"
-
-    return True, "accepted"
-
-def filter_serp_offers(product_row, shopping_results):
-    product_name = product_row.get("product") or ""
-    gtin = str(product_row.get("gtin") or "").strip()
-    offers = []
-
-    for item in shopping_results or []:
-        ok, reason = offer_plausible(product_row, item)
-        if not ok:
-            continue
-
-        raw_price = item.get("extracted_price")
-        if raw_price is None:
-            raw = str(item.get("price") or "").replace("$","").replace(",","").strip()
-            try:
-                raw_price = float(raw)
-            except Exception:
-                continue
-        try:
-            price = float(raw_price)
-        except Exception:
-            continue
-        if price <= 0:
-            continue
-
-        title = item.get("title") or ""
-        similarity = token_similarity(product_name, title)
-
-        # Economic sanity guard: an "exact" retail offer far below Southern wholesale
-        # is likely a wrong size/accessory/sample unless proven by GTIN.
-        southern_cost_inc = float(product_row.get("southern_cost_ex_gst") or 0) * 1.10
-        if southern_cost_inc > 0 and price < southern_cost_inc * 0.55 and not gtin:
-            continue
-
-        offers.append({
-            "retailer": item.get("source"),
-            "price": round(price,2),
-            "title": title,
-            "url": item.get("product_link"),
-            "position": item.get("position"),
-            "match_type": "GTIN_QUERY" if gtin else "TITLE_QUERY",
-            "similarity": round(similarity,3),
-            "delivery": item.get("delivery"),
-        })
-
-    dedup={}
-    for o in offers:
-        dedup[(o["retailer"],o["price"],o["title"])]=o
-    offers=list(dedup.values())
-    offers.sort(key=lambda x:x["price"])
-    return offers
-
-def clean_search_title(product: str) -> str:
-    s = re.sub(r"\s+", " ", product or "").strip()
-    # remove trailing duplicated operational numbers such as "13.72 kg 5"
-    s = re.sub(r"\s+\d+(?:\.\d+)?\s*kg\s+\d+\s*$", "", s, flags=re.I)
-    s = re.sub(r"\s+\d+(?:\.\d+)?\s+kg\s+\d+\s*$", "", s, flags=re.I)
-    s = re.sub(r"\s+\d+\s*$", "", s)
-    return s.strip(" -")
-
-async def live_market_for_product(product_row):
-    gtin = str(product_row.get("gtin") or "").strip()
-    clean_name = clean_search_title(product_row.get("product") or product_row.get("sku"))
-
-    queries = []
-    if gtin:
-        queries.append(gtin)
-    queries.append(clean_name)
-
-    # simplified fallback query retaining brand/core name + pack size
-    packs = re.findall(r"\b\d+(?:\.\d+)?\s*(?:kg|g|ml|l)\b", clean_name, flags=re.I)
-    tokens = clean_search_title(clean_name).split()
-    simple = " ".join(tokens[:9])
-    if packs and packs[-1].lower() not in simple.lower():
-        simple += " " + packs[-1]
-    if simple and simple not in queries:
-        queries.append(simple)
-
-    all_offers=[]
-    used_queries=[]
-    for q in queries[:3]:
-        data = await serpapi_shopping_search(q)
-        accepted = filter_serp_offers(product_row, data.get("shopping_results") or [])
-        all_offers.extend(accepted)
-        used_queries.append(q)
-
-        # stop early once we have enough distinct retailers
-        if len({(o.get("retailer") or "").lower() for o in all_offers}) >= MIN_BENCHMARK_OFFERS:
-            break
-
-    # dedupe across queries
-    dedup={}
-    for o in all_offers:
-        dedup[((o.get("retailer") or "").lower(), o["price"], o["title"])]=o
-    offers=list(dedup.values())
-    offers.sort(key=lambda x:x["price"])
-
-    distinct=[]
-    seen=set()
-    for o in offers:
-        retailer=(o.get("retailer") or "").lower()
-        if retailer in seen:
-            continue
-        seen.add(retailer)
-        distinct.append(o)
-
-    if len(distinct) < MIN_BENCHMARK_OFFERS:
-        return {
-            "verified": False,
-            "queries": used_queries,
-            "offer_count": len(distinct),
-            "offers": distinct[:10],
-            "benchmark_price": None,
-            "market_ceiling": None,
-        }
-
-    lowest = distinct[:3]
-    prices=sorted(o["price"] for o in lowest)
-    benchmark=prices[1]
-    ceiling=round(benchmark * MARKET_CEILING_MULTIPLIER,2)
-    return {
-        "verified": True,
-        "queries": used_queries,
-        "offer_count": len(distinct),
-        "offers": distinct[:10],
-        "benchmark_price": round(benchmark,2),
-        "market_ceiling": ceiling,
-    }
-
-
-    gtin = str(product_row.get("gtin") or "").strip()
-    name = product_row.get("product") or product_row.get("sku")
-    query = gtin if gtin else name
-    data = await serpapi_shopping_search(query)
-    offers = filter_serp_offers(product_row, data.get("shopping_results") or [])
-
-    # require distinct credible retailers
-    distinct=[]
-    seen=set()
-    for o in offers:
-        retailer=(o.get("retailer") or "").lower()
-        if retailer in seen:
-            continue
-        seen.add(retailer)
-        distinct.append(o)
-
-    if len(distinct) < MIN_BENCHMARK_OFFERS:
-        return {
-            "verified": False,
-            "query": query,
-            "offer_count": len(distinct),
-            "offers": distinct[:10],
-            "benchmark_price": None,
-            "market_ceiling": None,
-        }
-
-    lowest = distinct[:3]
-    prices=sorted(o["price"] for o in lowest)
-    benchmark=prices[1]
-    ceiling=round(benchmark * MARKET_CEILING_MULTIPLIER,2)
-    return {
-        "verified": True,
-        "query": query,
-        "offer_count": len(distinct),
-        "offers": distinct[:10],
-        "benchmark_price": round(benchmark,2),
-        "market_ceiling": ceiling,
-    }
-
-async def serp_final_rows(limit:int=5):
-    rows = await commercial_rows(limit)
-    final=[]
-    for r in rows:
-        market = await live_market_for_product(r)
-        required=r["proposed_price"]
-        hold=list(r.get("hold_reason") or [])
-        if r["stock"] <= 0:
-            status="TEMP_OUT_OF_STOCK"
-        elif not r["passes_margin"]:
-            status="COMMERCIAL_HOLD"
-            hold.append("margin")
-        elif not market["verified"]:
-            status="REVIEW_MARKET"
-            hold.append("market_unverified")
-        elif required > market["market_ceiling"]:
-            status="COMMERCIAL_HOLD"
-            hold.append("market_price")
-        else:
-            status="APPROVED_DRAFT"
-        final.append({
-            **r,
-            "market_queries": market.get("queries") or [market.get("query")],
-            "market_verified": market["verified"],
-            "market_offer_count": market["offer_count"],
-            "market_benchmark": market["benchmark_price"],
-            "market_ceiling": market["market_ceiling"],
-            "market_offers": market["offers"],
-            "final_status": status,
-            "hold_reason": list(dict.fromkeys(hold)),
-        })
-    return final
-
-
-
-async def mixed_price_rows(per_category:int=4):
-    """
-    Read a small balanced sample from five Southern categories.
-    This keeps the commercial test representative without consuming excessive SerpApi quota.
-    """
-    per_category = min(max(per_category,1),6)
-    client = await southern_authenticated_client()
-    out = []
-    try:
-        for category, url in MIXED_CATEGORY_URLS.items():
-            r = await client.get(url)
-            if r.status_code >= 400:
-                continue
-            rows = parse_southern_products(r.text, per_category)
-            for row in rows:
-                out.append({**row, "source_category": category, "source_url": str(r.url)})
-    finally:
-        await client.aclose()
-    return out
-
-async def commercial_rows_from_price_rows(price_rows):
-    _, stock_text = await fetch_csv_or_discover(SOUTHERN_STOCK_URL)
-    _, stock_rows = parse_delimited(stock_text)
-    smap = stock_map(stock_rows)
-
-    _, gtin_text = await fetch_csv_or_discover(SOUTHERN_GTIN_URL)
-    _, gtin_rows = parse_delimited(gtin_text)
-    gmap = gtin_map(gtin_rows)
-
-    out = []
-    for p in price_rows:
-        sku = p["sku"]
-        g = gmap.get(sku, {})
-        product = g.get("product_name") or p.get("title") or sku
-        product = clean_title(product, sku)
-        weight = g.get("weight") or p.get("page_weight")
-        weight_kg = parse_weight_kg(weight)
-        stock = smap.get(sku, 0)
-        calc = commercial_calc(float(p["active_cost_ex_gst"]), weight_kg, product)
-
-        hold=[]
-        if stock <= 0:
-            hold.append("supplier_stock")
-        if not calc["passes_margin"]:
-            hold.append("margin")
-
-        out.append({
-            "sku": sku,
-            "product": product,
-            "source_category": p.get("source_category"),
-            "southern_cost_ex_gst": p["active_cost_ex_gst"],
-            "former_cost_ex_gst": p.get("former_cost_ex_gst"),
-            "stock": stock,
-            "gtin": g.get("gtin"),
-            "weight": weight,
-            **calc,
-            "status": "LIVE" if not hold else "OUT_OF_STOCK",
-            "hold_reason": hold,
-        })
-    return out
-
-async def mixed_serp_final_rows(per_category:int=4):
-    price_rows = await mixed_price_rows(per_category)
-    commercial = await commercial_rows_from_price_rows(price_rows)
-    final = []
-
-    # One SerpApi benchmark per product. Caller controls sample size.
-    for r in commercial:
-        market = await live_market_for_product(r)
-        required = r["proposed_price"]
-        hold = list(r.get("hold_reason") or [])
-
-        if r["stock"] <= 0:
-            final_status = "TEMP_OUT_OF_STOCK"
-        elif not r["passes_margin"]:
-            final_status = "COMMERCIAL_HOLD"
-            hold.append("margin")
-        elif not market["verified"]:
-            final_status = "REVIEW_MARKET"
-            hold.append("market_unverified")
-        elif required > market["market_ceiling"]:
-            final_status = "COMMERCIAL_HOLD"
-            hold.append("market_price")
-        else:
-            final_status = "APPROVED_DRAFT"
-
-        final.append({
-            **r,
-            "market_queries": market.get("queries") or [market.get("query")],
-            "market_verified": market["verified"],
-            "market_offer_count": market["offer_count"],
-            "market_benchmark": market["benchmark_price"],
-            "market_ceiling": market["market_ceiling"],
-            "market_offers": market["offers"],
-            "final_status": final_status,
-            "hold_reason": list(dict.fromkeys(hold)),
-        })
-    return final
-
-
-
-def candidate_score(row):
-    """
-    Cheap Southern-only pre-screen. Higher score = better candidate for paid market lookup.
-    Favors margin, contribution, stock depth, lighter shipping and commercially attractive categories.
-    """
-    category_bonus = {
-        "bedding": 22,
-        "grooming": 20,
-        "walking": 18,
-        "toys": 16,
-        "general": 10,
-        "clothing": 6,
-        "mainstream_food": -12,
-    }.get(row.get("category_rule"), 8)
-
-    margin = float(row.get("margin_rate") or 0)
-    contribution = float(row.get("contribution") or 0)
-    stock = int(row.get("stock") or 0)
-    weight_kg = parse_weight_kg(row.get("weight"))
-
-    margin_score = min(50, margin * 100)
-    contribution_score = min(25, contribution / 2)
-    stock_score = min(20, stock * 1.5)
-
-    if weight_kg is None:
-        freight_score = 2
-    elif weight_kg <= 0.5:
-        freight_score = 18
-    elif weight_kg <= 2:
-        freight_score = 14
-    elif weight_kg <= 5:
-        freight_score = 9
-    elif weight_kg <= 10:
-        freight_score = 3
-    else:
-        freight_score = -10
-
-    low_stock_penalty = -15 if stock <= 2 else 0
-    no_margin_penalty = -50 if not row.get("passes_margin") else 0
-
-    return round(
-        category_bonus + margin_score + contribution_score +
-        stock_score + freight_score + low_stock_penalty + no_margin_penalty,
-        1
-    )
-
-async def candidate_pool(per_category:int=20, limit:int=50):
-    """
-    Build a Southern-only shortlist without SerpApi calls.
-    """
-    per_category = min(max(per_category, 1), 30)
-    price_rows = await mixed_price_rows(per_category)
-    commercial = await commercial_rows_from_price_rows(price_rows)
-
-    # Remove duplicates across category pages.
-    dedup = {}
-    for r in commercial:
-        sku = r["sku"]
-        score = candidate_score(r)
-        candidate = {**r, "candidate_score": score}
-        old = dedup.get(sku)
-        if old is None or score > old["candidate_score"]:
-            dedup[sku] = candidate
-
-    rows = list(dedup.values())
-    rows.sort(key=lambda x: (-x["candidate_score"], -x["stock"], x["proposed_price"]))
-    return rows[:min(max(limit,1),100)]
-
-async def top_candidate_market_rows(limit:int=25, per_category:int=20):
-    """
-    Spend SerpApi calls only on the strongest Southern-only candidates.
-    """
-    limit = min(max(limit,1),25)
-    candidates = await candidate_pool(per_category=per_category, limit=max(limit,50))
-    chosen = candidates[:limit]
-    final = []
-
-    for r in chosen:
-        market = await live_market_for_product(r)
-        hold = list(r.get("hold_reason") or [])
-
-        if r["stock"] <= 0:
-            status = "TEMP_OUT_OF_STOCK"
-        elif not r["passes_margin"]:
-            status = "COMMERCIAL_HOLD"
-            hold.append("margin")
-        elif not market["verified"]:
-            status = "REVIEW_MARKET"
-            hold.append("market_unverified")
-        elif r["proposed_price"] > market["market_ceiling"]:
-            status = "COMMERCIAL_HOLD"
-            hold.append("market_price")
-        else:
-            status = "APPROVED_DRAFT"
-
-        final.append({
-            **r,
-            "market_queries": market.get("queries") or [market.get("query")],
-            "market_verified": market["verified"],
-            "market_offer_count": market["offer_count"],
-            "market_benchmark": market["benchmark_price"],
-            "market_ceiling": market["market_ceiling"],
-            "market_offers": market["offers"],
-            "final_status": status,
-            "hold_reason": list(dict.fromkeys(hold)),
-        })
-    return final
-
 
 @app.get("/")
 async def root():
@@ -1575,6 +967,28 @@ async def top_candidates_market_table(limit:int=25, per_category:int=20):
     </body></html>
     """
     return HTMLResponse(html)
+
+
+
+@app.get("/economics/policy")
+async def economics_policy():
+    return {
+        "ok": True,
+        "model": "basket_level_profitability",
+        "minimum_order_value": MINIMUM_ORDER_VALUE,
+        "target_basket_contribution": TARGET_BASKET_CONTRIBUTION,
+        "customer_shipping_below_free_threshold": DEFAULT_CUSTOMER_SHIPPING,
+        "free_shipping_threshold": FREE_SHIPPING_THRESHOLD,
+        "max_product_freight_subsidy": MAX_FREIGHT_SUBSIDY,
+        "retail_bands": [
+            {"retail":"under $15","min_contribution":2.00,"min_margin":0.18},
+            {"retail":"$15-$29.99","min_contribution":3.50,"min_margin":0.20},
+            {"retail":"$30-$59.99","min_contribution":6.00,"min_margin":0.22},
+            {"retail":"$60-$99.99","min_contribution":10.00,"min_margin":0.24},
+            {"retail":"$100+","min_contribution":15.00,"min_margin":0.18},
+        ],
+        "rule": "SKU must remain profitable; order-level economics are protected by minimum order and shipping rules."
+    }
 
 
 @app.post("/sync/stock")
