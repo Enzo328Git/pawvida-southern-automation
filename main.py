@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "PawVida Southern Automation"
-VERSION = "12.0.0"
+VERSION = "13.0.0"
 
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "pawvida-6")
@@ -81,7 +81,14 @@ SERPAPI_HL = os.getenv("SERPAPI_HL", "en")
 MARKETPLACE_BLOCKLIST = {
     x.strip().lower() for x in os.getenv(
         "MARKETPLACE_BLOCKLIST",
-        "ebay,temu,aliexpress,catch"
+        "ebay,temu,aliexpress,catch,kogan"
+    ).split(",") if x.strip()
+}
+
+SECONDARY_RETAILER_LIST = {
+    x.strip().lower() for x in os.getenv(
+        "SECONDARY_RETAILER_LIST",
+        "amazon,amazon au"
     ).split(",") if x.strip()
 }
 
@@ -692,14 +699,68 @@ def core_title_tokens(value: str | None):
             toks.append(x)
     return set(toks)
 
+
+SIZE_WORDS = {"small","medium","large","giant","extra small","extra large","xl","xs"}
+FLAVOUR_WORDS = {
+    "chicken","lamb","beef","salmon","bacon","turkey","duck","tuna","fish","rice"
+}
+
+def size_variant(value: str | None):
+    s = normalize_product_text(value)
+    # Prefer explicit compound sizes first.
+    compounds = [
+        ("extra small", ["extra small","x small","xsmall","xs"]),
+        ("extra large", ["extra large","x large","xlarge","xl"]),
+    ]
+    for canonical, variants in compounds:
+        if any(v in s for v in variants):
+            return canonical
+    for w in ["small","medium","large","giant"]:
+        if re.search(rf"\b{re.escape(w)}\b", s):
+            return w
+    return None
+
+def flavour_tokens(value: str | None):
+    s = normalize_product_text(value)
+    return {w for w in FLAVOUR_WORDS if re.search(rf"\b{re.escape(w)}\b", s)}
+
+def retailer_quality(source: str | None):
+    s = normalize_product_text(source)
+    if any(block in s for block in MARKETPLACE_BLOCKLIST):
+        return "blocked"
+    if any(sec in s for sec in SECONDARY_RETAILER_LIST):
+        return "secondary"
+    return "primary"
+
+def hard_variant_match(product_name: str, result_title: str) -> bool:
+    wanted_size = size_variant(product_name)
+    result_size = size_variant(result_title)
+    if wanted_size:
+        if not result_size or result_size != wanted_size:
+            return False
+
+    wanted_flavours = flavour_tokens(product_name)
+    result_flavours = flavour_tokens(result_title)
+    # Only enforce flavour when the source product contains one.
+    if wanted_flavours:
+        if not result_flavours or not (wanted_flavours & result_flavours):
+            return False
+
+    return True
+
 def offer_plausible(product_row, item) -> tuple[bool, str]:
     title = item.get("title") or ""
     source = item.get("source") or ""
-    if source_blocked(source):
+
+    quality = retailer_quality(source)
+    if quality == "blocked":
         return False, "blocked_source"
 
     if not pack_match(product_row.get("product") or "", title):
         return False, "pack_mismatch"
+
+    if not hard_variant_match(product_row.get("product") or "", title):
+        return False, "variant_mismatch"
 
     p_tokens = core_title_tokens(product_row.get("product") or "")
     r_tokens = core_title_tokens(title)
@@ -753,6 +814,7 @@ def filter_serp_offers(product_row, shopping_results):
 
         offers.append({
             "retailer": item.get("source"),
+            "retailer_quality": retailer_quality(item.get("source")),
             "price": round(price,2),
             "title": title,
             "url": item.get("product_link"),
@@ -905,17 +967,24 @@ async def live_market_for_product(product_row):
         seen.add(retailer)
         distinct.append(o)
 
-    if len(distinct) < MIN_BENCHMARK_OFFERS:
+    primary = [o for o in distinct if o.get("retailer_quality") == "primary"]
+    secondary = [o for o in distinct if o.get("retailer_quality") == "secondary"]
+
+    # Automatic benchmark should use primary retailers first.
+    benchmark_pool = primary if len(primary) >= MIN_BENCHMARK_OFFERS else primary + secondary
+
+    if len(benchmark_pool) < MIN_BENCHMARK_OFFERS:
         return {
             "verified": False,
             "queries": used_queries,
             "offer_count": len(distinct),
+            "primary_offer_count": len(primary),
             "offers": distinct[:10],
             "benchmark_price": None,
             "market_ceiling": None,
         }
 
-    lowest = distinct[:3]
+    lowest = sorted(benchmark_pool, key=lambda x: x["price"])[:3]
     prices = sorted(o["price"] for o in lowest)
     benchmark = prices[1]
     ceiling = round(benchmark * MARKET_CEILING_MULTIPLIER, 2)
@@ -924,6 +993,7 @@ async def live_market_for_product(product_row):
         "verified": True,
         "queries": used_queries,
         "offer_count": len(distinct),
+        "primary_offer_count": len(primary),
         "offers": distinct[:10],
         "benchmark_price": round(benchmark, 2),
         "market_ceiling": ceiling,
@@ -1944,6 +2014,26 @@ async def market_query_preview(per_category:int=60, limit:int=25):
             "queries": build_market_queries(r),
         } for r in candidates],
         "note": "No SerpApi calls. Query-quality diagnostic only."
+    }
+
+
+@app.get("/market/variant-preview")
+async def market_variant_preview(per_category:int=60, limit:int=25):
+    candidates = await launch_candidate_pool(
+        per_category=min(max(per_category,1),100),
+        max_candidates=min(max(limit,1),100)
+    )
+    return {
+        "ok": True,
+        "count": len(candidates),
+        "rows": [{
+            "sku": r["sku"],
+            "product": r["product"],
+            "size_variant": size_variant(r["product"]),
+            "flavours": sorted(flavour_tokens(r["product"])),
+            "queries": build_market_queries(r),
+        } for r in candidates],
+        "note": "No SerpApi calls. Variant/search diagnostic only."
     }
 
 @app.post("/sync/stock")
