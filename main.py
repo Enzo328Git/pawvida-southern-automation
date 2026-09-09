@@ -1,3 +1,4 @@
+
 import csv, io, os, time, re
 from typing import Any
 from urllib.parse import urljoin
@@ -11,11 +12,20 @@ SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "pawvida-6")
 SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "")
 SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "")
+
 SOUTHERN_STOCK_URL = os.getenv("SOUTHERN_STOCK_URL", "https://www.agline.com/stock-level-csv/")
 SOUTHERN_GTIN_URL = os.getenv("SOUTHERN_GTIN_URL", "https://www.southernpetsupplies.com.au/resources/product-barcode-gtin-list/")
+SOUTHERN_LOGIN_URL = os.getenv("SOUTHERN_LOGIN_URL", "https://www.southernpetsupplies.com.au/my-account/")
+SOUTHERN_PRICING_SAMPLE_URL = os.getenv(
+    "SOUTHERN_PRICING_SAMPLE_URL",
+    "https://www.southernpetsupplies.com.au/category/dog-products/dog-food/"
+)
+SOUTHERN_USERNAME = os.getenv("SOUTHERN_USERNAME", "")
+SOUTHERN_PASSWORD = os.getenv("SOUTHERN_PASSWORD", "")
+
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() in {"1","true","yes","on"}
 
-app = FastAPI(title=APP_NAME, version="1.0.0")
+app = FastAPI(title=APP_NAME, version="2.0.0")
 _token_cache: dict[str, Any] = {"token": None, "expires_at": 0}
 
 def shop_domain() -> str:
@@ -62,20 +72,17 @@ async def shopify_graphql(query: str, variables: dict | None = None):
     return data.get("data")
 
 async def fetch_csv_or_discover(source_url: str):
-    headers = {"User-Agent": "PawVidaAutomation/1.0"}
+    headers = {"User-Agent": "PawVidaAutomation/2.0"}
     async with httpx.AsyncClient(timeout=45, follow_redirects=True, headers=headers) as client:
         r = await client.get(source_url)
         r.raise_for_status()
         ctype = r.headers.get("content-type", "").lower()
         text = r.text
-        # Direct CSV / TSV response
         if "csv" in ctype or source_url.lower().endswith(".csv"):
             return str(r.url), text
-        # Heuristic: CSV-looking content
         first = text[:1000]
         if "<html" not in first.lower() and ("," in first or "\t" in first):
             return str(r.url), text
-        # Otherwise discover a linked CSV from the page
         soup = BeautifulSoup(text, "html.parser")
         candidates = []
         for a in soup.find_all("a", href=True):
@@ -105,20 +112,183 @@ def parse_delimited(text: str, limit: int = 20):
             break
     return reader.fieldnames or [], rows
 
+def money_values(text: str):
+    vals = []
+    for m in re.finditer(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", text):
+        try:
+            vals.append(float(m.group(1).replace(",", "")))
+        except Exception:
+            pass
+    return vals
+
+def first_match(patterns, text):
+    for p in patterns:
+        m = re.search(p, text, re.I)
+        if m:
+            return m.group(1).strip()
+    return None
+
+def parse_southern_products(html: str, limit: int = 50):
+    soup = BeautifulSoup(html, "html.parser")
+    products = []
+
+    # Southern pages render product rows/blocks with SKU, description, price, weight and stock.
+    # Use several candidate containers so minor theme changes do not immediately break parsing.
+    candidates = []
+    for selector in [
+        "li.product", ".product", "tr", ".products > *",
+        ".product-row", ".woocommerce-loop-product"
+    ]:
+        candidates.extend(soup.select(selector))
+
+    seen = set()
+    for node in candidates:
+        text = " ".join(node.stripped_strings)
+        if not text or len(text) < 15:
+            continue
+
+        sku = first_match([
+            r"\bSKU\b\s*[:\-]?\s*([A-Z0-9][A-Z0-9.\-_/]+)",
+            r"\b([A-Z]{1,6}[0-9][A-Z0-9.\-_/]{2,})\b"
+        ], text)
+        if not sku or sku in seen:
+            continue
+
+        # Only accept blocks that appear product-like.
+        if "price" not in text.lower() and "$" not in text:
+            continue
+
+        prices = money_values(text)
+        active_price = prices[-1] if prices else None  # sale price normally appears after crossed-out price
+        old_price = prices[0] if len(prices) > 1 else None
+
+        weight = first_match([
+            r"\bWeight\b\s*[:\-]?\s*([0-9.]+\s*kg)",
+            r"\b([0-9.]+\s*kg)\b"
+        ], text)
+        stock = first_match([
+            r"\b(?:Stock|Quantity)\b\s*[:\-]?\s*([0-9]+)",
+        ], text)
+
+        # Product title: prefer a heading/link text, otherwise clean the block text.
+        title = None
+        heading = node.find(["h2","h3","h4"])
+        if heading:
+            title = " ".join(heading.stripped_strings)
+        if not title:
+            a = node.find("a", href=True)
+            if a:
+                at = " ".join(a.stripped_strings)
+                if len(at) > 4 and "product info" not in at.lower():
+                    title = at
+        if not title:
+            title = text[:180]
+
+        image = None
+        img = node.find("img")
+        if img:
+            image = img.get("data-src") or img.get("src")
+
+        link = None
+        for a in node.find_all("a", href=True):
+            label = " ".join(a.stripped_strings).lower()
+            href = a["href"]
+            if "product" in label or "/product/" in href:
+                link = urljoin(SOUTHERN_PRICING_SAMPLE_URL, href)
+                break
+
+        products.append({
+            "sku": sku,
+            "title": title,
+            "active_cost_ex_gst": active_price,
+            "former_cost_ex_gst": old_price,
+            "weight": weight,
+            "displayed_stock": int(stock) if stock and stock.isdigit() else None,
+            "image": image,
+            "product_url": link,
+        })
+        seen.add(sku)
+        if len(products) >= limit:
+            break
+
+    return products
+
+async def southern_authenticated_client():
+    if not SOUTHERN_USERNAME or not SOUTHERN_PASSWORD:
+        raise HTTPException(500, "SOUTHERN_USERNAME / SOUTHERN_PASSWORD are not configured")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; PawVidaAutomation/2.0; +https://pawvida-6.myshopify.com)",
+        "Accept-Language": "en-AU,en;q=0.9",
+    }
+    client = httpx.AsyncClient(timeout=45, follow_redirects=True, headers=headers)
+
+    login_page = await client.get(SOUTHERN_LOGIN_URL)
+    if login_page.status_code >= 400:
+        await client.aclose()
+        raise HTTPException(login_page.status_code, "Could not open Southern login page")
+
+    soup = BeautifulSoup(login_page.text, "html.parser")
+    form = None
+    for f in soup.find_all("form"):
+        txt = " ".join(f.stripped_strings).lower()
+        if "log in" in txt or "login" in txt:
+            if f.find("input", {"name": "username"}) or f.find("input", {"name": "password"}):
+                form = f
+                break
+    if not form:
+        await client.aclose()
+        raise HTTPException(502, "Could not identify Southern login form")
+
+    payload = {}
+    for inp in form.find_all("input"):
+        name = inp.get("name")
+        if name:
+            payload[name] = inp.get("value", "")
+
+    # Standard WooCommerce account login fields.
+    payload["username"] = SOUTHERN_USERNAME
+    payload["password"] = SOUTHERN_PASSWORD
+    payload["login"] = payload.get("login") or "Log in"
+    payload["rememberme"] = "forever"
+
+    action = form.get("action") or SOUTHERN_LOGIN_URL
+    action = urljoin(str(login_page.url), action)
+    post = await client.post(action, data=payload)
+
+    # Verify login by checking My Account and a price-gated catalogue page.
+    account = await client.get(SOUTHERN_LOGIN_URL)
+    account_text = account.text.lower()
+    if "logout" not in account_text and "log out" not in account_text:
+        # Some sites omit logout from the rendered page; the pricing page gives a second verification.
+        test = await client.get(SOUTHERN_PRICING_SAMPLE_URL)
+        if "login to view prices" in test.text.lower():
+            await client.aclose()
+            raise HTTPException(401, "Southern login was not accepted. Recheck username/password.")
+    return client
+
 @app.get("/")
 async def root():
     return {
         "service": APP_NAME,
         "status": "running",
+        "version": "2.0.0",
         "dry_run": DRY_RUN,
         "shop": shop_domain(),
         "api_version": SHOPIFY_API_VERSION,
-        "next": ["/health", "/shopify/test", "/southern/stock-preview", "/southern/gtin-preview"]
+        "next": [
+            "/health",
+            "/shopify/test",
+            "/southern/stock-preview",
+            "/southern/gtin-preview",
+            "/southern/login-test",
+            "/southern/pricing-preview"
+        ]
     }
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "dry_run": DRY_RUN}
+    return {"ok": True, "dry_run": DRY_RUN, "version": "2.0.0"}
 
 @app.get("/shopify/test")
 async def shopify_test():
@@ -144,6 +314,46 @@ async def gtin_preview(limit: int = 10):
     fields, rows = parse_delimited(text, min(max(limit,1),50))
     return {"ok": True, "resolved_url": url, "fields": fields, "rows": rows, "note": "Preview only; no Shopify changes are made."}
 
+@app.get("/southern/login-test")
+async def southern_login_test():
+    client = await southern_authenticated_client()
+    try:
+        r = await client.get(SOUTHERN_PRICING_SAMPLE_URL)
+        logged_in = "login to view prices" not in r.text.lower()
+        return {
+            "ok": logged_in,
+            "logged_in": logged_in,
+            "url": str(r.url),
+            "credentials_present": bool(SOUTHERN_USERNAME and SOUTHERN_PASSWORD),
+            "note": "No credentials are returned. Read-only test."
+        }
+    finally:
+        await client.aclose()
+
+@app.get("/southern/pricing-preview")
+async def southern_pricing_preview(limit: int = 20, url: str | None = None):
+    target = url or SOUTHERN_PRICING_SAMPLE_URL
+    if not target.startswith("https://www.southernpetsupplies.com.au/"):
+        raise HTTPException(400, "Pricing preview is restricted to southernpetsupplies.com.au")
+    client = await southern_authenticated_client()
+    try:
+        r = await client.get(target)
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, f"Southern pricing page failed: {r.status_code}")
+        if "login to view prices" in r.text.lower():
+            raise HTTPException(401, "Southern session is not authenticated")
+        rows = parse_southern_products(r.text, min(max(limit,1),100))
+        return {
+            "ok": True,
+            "dry_run": DRY_RUN,
+            "url": str(r.url),
+            "count": len(rows),
+            "rows": rows,
+            "note": "Read-only pricing preview. No Shopify changes and no Southern orders are made."
+        }
+    finally:
+        await client.aclose()
+
 @app.post("/sync/stock")
 async def sync_stock():
     if DRY_RUN:
@@ -157,4 +367,4 @@ async def sync_stock():
             "detected_fields": fields,
             "sample_rows": rows,
         })
-    raise HTTPException(501, "Live stock write is locked in v1 until Southern column mapping and Shopify location are verified.")
+    raise HTTPException(501, "Live stock write remains locked until pricing, margin rules and SKU mappings are approved.")
