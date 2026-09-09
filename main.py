@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "PawVida Southern Automation"
-VERSION = "10.0.0"
+VERSION = "11.0.0"
 
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "pawvida-6")
@@ -54,6 +54,13 @@ TARGET_BASKET_CONTRIBUTION = float(os.getenv("TARGET_BASKET_CONTRIBUTION", "12")
 LAUNCH_TARGET_APPROVED = int(os.getenv("LAUNCH_TARGET_APPROVED", "100"))
 LAUNCH_MAX_CANDIDATES = int(os.getenv("LAUNCH_MAX_CANDIDATES", "300"))
 MIN_RESILIENCE_FOR_PRIORITY = float(os.getenv("MIN_RESILIENCE_FOR_PRIORITY", "0.05"))
+MAX_CATEGORY_PAGES = int(os.getenv("MAX_CATEGORY_PAGES", "10"))
+LAUNCH_PER_CATEGORY = int(os.getenv("LAUNCH_PER_CATEGORY", "60"))
+SOUTHERN_WALKING_URL = os.getenv(
+    "SOUTHERN_WALKING_URL",
+    "https://www.southernpetsupplies.com.au/category/dog-products/dog-collars-leads-harnesses/"
+)
+
 
 
 
@@ -1119,6 +1126,76 @@ async def top_candidate_market_rows(limit:int=25, per_category:int=20):
 
 
 
+
+def paged_category_url(base_url: str, page: int) -> str:
+    if page <= 1:
+        return base_url
+    if "?" in base_url:
+        path, query = base_url.split("?", 1)
+        return path.rstrip("/") + f"/page/{page}/?" + query
+    return base_url.rstrip("/") + f"/page/{page}/"
+
+async def paginated_launch_price_rows(per_category:int=60):
+    """
+    Crawl multiple pages per Southern category, collecting unique SKUs before
+    any SerpApi calls are made.
+    """
+    per_category = min(max(per_category,1),100)
+    categories = dict(MIXED_CATEGORY_URLS)
+    categories["walking"] = SOUTHERN_WALKING_URL
+
+    client = await southern_authenticated_client()
+    collected = []
+    try:
+        for category, base_url in categories.items():
+            seen = set()
+            for page in range(1, MAX_CATEGORY_PAGES + 1):
+                url = paged_category_url(base_url, page)
+                r = await client.get(url)
+                if r.status_code >= 400:
+                    break
+                rows = parse_southern_products(r.text, 100)
+                new_count = 0
+                for row in rows:
+                    sku = row.get("sku")
+                    if not sku or sku in seen:
+                        continue
+                    seen.add(sku)
+                    collected.append({
+                        **row,
+                        "source_category": category,
+                        "source_url": str(r.url),
+                        "source_page": page,
+                    })
+                    new_count += 1
+                    if len(seen) >= per_category:
+                        break
+                if len(seen) >= per_category:
+                    break
+                # End pagination when a page yields no new products.
+                if new_count == 0:
+                    break
+    finally:
+        await client.aclose()
+    return collected
+
+async def paginated_candidate_pool(per_category:int=60, limit:int=300):
+    price_rows = await paginated_launch_price_rows(per_category=per_category)
+    commercial = await commercial_rows_from_price_rows(price_rows)
+
+    dedup = {}
+    for r in commercial:
+        sku = r["sku"]
+        score = candidate_score(r)
+        candidate = {**r, "candidate_score": score}
+        old = dedup.get(sku)
+        if old is None or score > old["candidate_score"]:
+            dedup[sku] = candidate
+
+    rows = list(dedup.values())
+    rows.sort(key=lambda x: (-x["candidate_score"], -x["stock"], x["proposed_price"]))
+    return rows[:min(max(limit,1),LAUNCH_MAX_CANDIDATES)]
+
 def resilience_score(required_price, market_ceiling):
     if not market_ceiling or market_ceiling <= 0:
         return None
@@ -1131,9 +1208,9 @@ def launch_priority(row):
         return round(base - 20, 1)
     return round(base + max(-40, min(60, resilience * 200)), 1)
 
-async def launch_candidate_pool(per_category:int=30, max_candidates:int=300):
-    return await candidate_pool(
-        per_category=min(max(per_category,1),30),
+async def launch_candidate_pool(per_category:int=60, max_candidates:int=300):
+    return await paginated_candidate_pool(
+        per_category=min(max(per_category,1),100),
         limit=min(max(max_candidates,1),LAUNCH_MAX_CANDIDATES)
     )
 
@@ -1164,6 +1241,7 @@ async def benchmark_candidate_batch(candidates, max_products:int=50):
             "market_ceiling": market["market_ceiling"],
             "market_offers": market["offers"],
             "resilience": resilience,
+            "strong_launch_candidate": bool(status == "APPROVED_DRAFT" and resilience is not None and resilience >= MIN_RESILIENCE_FOR_PRIORITY),
             "final_status": status,
             "hold_reason": list(dict.fromkeys(hold)),
         }
@@ -1177,7 +1255,7 @@ async def benchmark_candidate_batch(candidates, max_products:int=50):
     ))
     return final
 
-async def build_launch_shortlist(per_category:int=30, benchmark_limit:int=50, approved_target:int=100):
+async def build_launch_shortlist(per_category:int=60, benchmark_limit:int=50, approved_target:int=100):
     candidates = await launch_candidate_pool(
         per_category=per_category,
         max_candidates=LAUNCH_MAX_CANDIDATES
@@ -1713,7 +1791,7 @@ async def economics_policy():
 
 
 @app.get("/southern/launch-candidate-pool")
-async def launch_candidate_pool_preview(per_category:int=30, limit:int=300):
+async def launch_candidate_pool_preview(per_category:int=60, limit:int=300):
     rows = await launch_candidate_pool(per_category=per_category, max_candidates=limit)
     return {
         "ok": True,
@@ -1724,7 +1802,7 @@ async def launch_candidate_pool_preview(per_category:int=30, limit:int=300):
     }
 
 @app.get("/southern/launch-shortlist-preview")
-async def launch_shortlist_preview(per_category:int=30, benchmark_limit:int=25, approved_target:int=100):
+async def launch_shortlist_preview(per_category:int=60, benchmark_limit:int=25, approved_target:int=100):
     benchmark_limit = min(max(benchmark_limit,1),50)
     result = await build_launch_shortlist(
         per_category=per_category,
@@ -1734,7 +1812,7 @@ async def launch_shortlist_preview(per_category:int=30, benchmark_limit:int=25, 
     return {"ok": True, "dry_run": DRY_RUN, **result}
 
 @app.get("/southern/launch-shortlist-table", response_class=HTMLResponse)
-async def launch_shortlist_table(per_category:int=30, benchmark_limit:int=25, approved_target:int=100):
+async def launch_shortlist_table(per_category:int=60, benchmark_limit:int=25, approved_target:int=100):
     benchmark_limit = min(max(benchmark_limit,1),50)
     result = await build_launch_shortlist(
         per_category=per_category,
