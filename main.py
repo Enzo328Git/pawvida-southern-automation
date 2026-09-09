@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "PawVida Southern Automation"
-VERSION = "5.0.0"
+VERSION = "6.0.0"
 
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "pawvida-6")
@@ -582,17 +582,95 @@ async def serpapi_shopping_search(query: str):
     _serp_cache[cache_key] = {"ts": time.time(), "data": data}
     return data
 
+
+def numeric_pack_signature(value: str | None):
+    s = normalize_product_text(value)
+    sig = []
+    for num, unit in re.findall(r"\b(\d+(?:\.\d+)?)\s*(kg|g|ml|l)\b", s):
+        try:
+            n = float(num)
+        except Exception:
+            continue
+        # normalize kg/g and l/ml
+        if unit == "kg":
+            sig.append(("mass_g", round(n*1000,1)))
+        elif unit == "g":
+            sig.append(("mass_g", round(n,1)))
+        elif unit == "l":
+            sig.append(("volume_ml", round(n*1000,1)))
+        elif unit == "ml":
+            sig.append(("volume_ml", round(n,1)))
+    return sig
+
+def pack_match(product_name: str, result_title: str) -> bool:
+    wanted = numeric_pack_signature(product_name)
+    found = numeric_pack_signature(result_title)
+    if not wanted:
+        return True
+    if not found:
+        # Missing pack size is not enough for auto-approval
+        return False
+    for wu, wv in wanted:
+        for fu, fv in found:
+            if wu == fu and abs(wv-fv) <= max(1.0, wv*0.02):
+                return True
+    return False
+
+def brand_tokens(value: str | None):
+    s = normalize_product_text(value)
+    # first meaningful token is usually brand on these catalogue titles
+    toks = [x for x in s.split() if len(x) > 2 and not x.isdigit()]
+    return toks[:2]
+
+def core_title_tokens(value: str | None):
+    stop = {
+        "adult","dog","dogs","cat","cats","food","dry","with","and","the","for",
+        "kg","g","ml","l","all","breed","breeds","original","current","price","was"
+    }
+    toks = []
+    for x in normalize_product_text(value).split():
+        if x in stop or re.fullmatch(r"\d+(?:\.\d+)?", x):
+            continue
+        if len(x) > 2:
+            toks.append(x)
+    return set(toks)
+
+def offer_plausible(product_row, item) -> tuple[bool, str]:
+    title = item.get("title") or ""
+    source = item.get("source") or ""
+    if source_blocked(source):
+        return False, "blocked_source"
+
+    if not pack_match(product_row.get("product") or "", title):
+        return False, "pack_mismatch"
+
+    p_tokens = core_title_tokens(product_row.get("product") or "")
+    r_tokens = core_title_tokens(title)
+    if not p_tokens or not r_tokens:
+        return False, "weak_title"
+
+    overlap = len(p_tokens & r_tokens)
+    # Require at least 2 meaningful shared tokens, or 1 if very short title.
+    if overlap < (1 if len(p_tokens) <= 2 else 2):
+        return False, "title_mismatch"
+
+    # Brand consistency: first meaningful token should appear in result.
+    brands = brand_tokens(product_row.get("product") or "")
+    if brands and brands[0] not in normalize_product_text(title).split():
+        return False, "brand_mismatch"
+
+    return True, "accepted"
+
 def filter_serp_offers(product_row, shopping_results):
     product_name = product_row.get("product") or ""
     gtin = str(product_row.get("gtin") or "").strip()
-    wanted_sizes = pack_tokens(product_name)
     offers = []
 
     for item in shopping_results or []:
-        source = item.get("source") or ""
-        if source_blocked(source):
+        ok, reason = offer_plausible(product_row, item)
+        if not ok:
             continue
-        title = item.get("title") or ""
+
         raw_price = item.get("extracted_price")
         if raw_price is None:
             raw = str(item.get("price") or "").replace("$","").replace(",","").strip()
@@ -607,30 +685,26 @@ def filter_serp_offers(product_row, shopping_results):
         if price <= 0:
             continue
 
-        result_sizes = pack_tokens(title)
-        if wanted_sizes and result_sizes and not (wanted_sizes & result_sizes):
-            continue
-
+        title = item.get("title") or ""
         similarity = token_similarity(product_name, title)
 
-        # GTIN searches are usually highly precise; title fallback needs stronger similarity.
-        match_type = "GTIN_QUERY" if gtin else "TITLE_QUERY"
-        min_sim = 0.18 if gtin else 0.42
-        if similarity < min_sim:
+        # Economic sanity guard: an "exact" retail offer far below Southern wholesale
+        # is likely a wrong size/accessory/sample unless proven by GTIN.
+        southern_cost_inc = float(product_row.get("southern_cost_ex_gst") or 0) * 1.10
+        if southern_cost_inc > 0 and price < southern_cost_inc * 0.55 and not gtin:
             continue
 
         offers.append({
-            "retailer": source,
+            "retailer": item.get("source"),
             "price": round(price,2),
             "title": title,
             "url": item.get("product_link"),
             "position": item.get("position"),
-            "match_type": match_type,
+            "match_type": "GTIN_QUERY" if gtin else "TITLE_QUERY",
             "similarity": round(similarity,3),
             "delivery": item.get("delivery"),
         })
 
-    # de-dupe exact same retailer/price/title
     dedup={}
     for o in offers:
         dedup[(o["retailer"],o["price"],o["title"])]=o
@@ -638,7 +712,84 @@ def filter_serp_offers(product_row, shopping_results):
     offers.sort(key=lambda x:x["price"])
     return offers
 
+def clean_search_title(product: str) -> str:
+    s = re.sub(r"\s+", " ", product or "").strip()
+    # remove trailing duplicated operational numbers such as "13.72 kg 5"
+    s = re.sub(r"\s+\d+(?:\.\d+)?\s*kg\s+\d+\s*$", "", s, flags=re.I)
+    s = re.sub(r"\s+\d+(?:\.\d+)?\s+kg\s+\d+\s*$", "", s, flags=re.I)
+    s = re.sub(r"\s+\d+\s*$", "", s)
+    return s.strip(" -")
+
 async def live_market_for_product(product_row):
+    gtin = str(product_row.get("gtin") or "").strip()
+    clean_name = clean_search_title(product_row.get("product") or product_row.get("sku"))
+
+    queries = []
+    if gtin:
+        queries.append(gtin)
+    queries.append(clean_name)
+
+    # simplified fallback query retaining brand/core name + pack size
+    packs = re.findall(r"\b\d+(?:\.\d+)?\s*(?:kg|g|ml|l)\b", clean_name, flags=re.I)
+    tokens = clean_search_title(clean_name).split()
+    simple = " ".join(tokens[:9])
+    if packs and packs[-1].lower() not in simple.lower():
+        simple += " " + packs[-1]
+    if simple and simple not in queries:
+        queries.append(simple)
+
+    all_offers=[]
+    used_queries=[]
+    for q in queries[:3]:
+        data = await serpapi_shopping_search(q)
+        accepted = filter_serp_offers(product_row, data.get("shopping_results") or [])
+        all_offers.extend(accepted)
+        used_queries.append(q)
+
+        # stop early once we have enough distinct retailers
+        if len({(o.get("retailer") or "").lower() for o in all_offers}) >= MIN_BENCHMARK_OFFERS:
+            break
+
+    # dedupe across queries
+    dedup={}
+    for o in all_offers:
+        dedup[((o.get("retailer") or "").lower(), o["price"], o["title"])]=o
+    offers=list(dedup.values())
+    offers.sort(key=lambda x:x["price"])
+
+    distinct=[]
+    seen=set()
+    for o in offers:
+        retailer=(o.get("retailer") or "").lower()
+        if retailer in seen:
+            continue
+        seen.add(retailer)
+        distinct.append(o)
+
+    if len(distinct) < MIN_BENCHMARK_OFFERS:
+        return {
+            "verified": False,
+            "queries": used_queries,
+            "offer_count": len(distinct),
+            "offers": distinct[:10],
+            "benchmark_price": None,
+            "market_ceiling": None,
+        }
+
+    lowest = distinct[:3]
+    prices=sorted(o["price"] for o in lowest)
+    benchmark=prices[1]
+    ceiling=round(benchmark * MARKET_CEILING_MULTIPLIER,2)
+    return {
+        "verified": True,
+        "queries": used_queries,
+        "offer_count": len(distinct),
+        "offers": distinct[:10],
+        "benchmark_price": round(benchmark,2),
+        "market_ceiling": ceiling,
+    }
+
+
     gtin = str(product_row.get("gtin") or "").strip()
     name = product_row.get("product") or product_row.get("sku")
     query = gtin if gtin else name
@@ -700,7 +851,7 @@ async def serp_final_rows(limit:int=5):
             status="APPROVED_DRAFT"
         final.append({
             **r,
-            "market_query": market["query"],
+            "market_queries": market.get("queries") or [market.get("query")],
             "market_verified": market["verified"],
             "market_offer_count": market["offer_count"],
             "market_benchmark": market["benchmark_price"],
