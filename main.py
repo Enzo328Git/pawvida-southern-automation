@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "PawVida Southern Automation"
-VERSION = "11.0.0"
+VERSION = "11.1.0"
 
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "pawvida-6")
@@ -629,7 +629,13 @@ async def serpapi_shopping_search(query: str):
         raise HTTPException(r.status_code, f"SerpApi request failed: {r.text[:500]}")
     data = r.json()
     if data.get("error"):
-        raise HTTPException(502, f"SerpApi error: {data['error']}")
+        err = str(data.get("error") or "")
+        # Google Shopping sometimes returns a valid "no results" response for niche SKUs.
+        # Treat that as an empty search result, not a fatal batch error.
+        if "hasn't returned any results" in err.lower() or "no results" in err.lower():
+            data = {"shopping_results": [], "search_metadata": {"status": "No results"}}
+        else:
+            raise HTTPException(502, f"SerpApi error: {err}")
     _serp_cache[cache_key] = {"ts": time.time(), "data": data}
     return data
 
@@ -1217,7 +1223,18 @@ async def launch_candidate_pool(per_category:int=60, max_candidates:int=300):
 async def benchmark_candidate_batch(candidates, max_products:int=50):
     final = []
     for r in candidates[:max_products]:
-        market = await live_market_for_product(r)
+        try:
+            market = await live_market_for_product(r)
+        except Exception as exc:
+            market = {
+                "verified": False,
+                "offer_count": 0,
+                "offers": [],
+                "benchmark_price": None,
+                "market_ceiling": None,
+                "queries": [],
+                "lookup_error": str(exc)[:300],
+            }
         hold = list(r.get("hold_reason") or [])
         if r["stock"] <= 0:
             status = "TEMP_OUT_OF_STOCK"
@@ -1240,6 +1257,7 @@ async def benchmark_candidate_batch(candidates, max_products:int=50):
             "market_benchmark": market["benchmark_price"],
             "market_ceiling": market["market_ceiling"],
             "market_offers": market["offers"],
+            "market_lookup_error": market.get("lookup_error"),
             "resilience": resilience,
             "strong_launch_candidate": bool(status == "APPROVED_DRAFT" and resilience is not None and resilience >= MIN_RESILIENCE_FOR_PRIORITY),
             "final_status": status,
