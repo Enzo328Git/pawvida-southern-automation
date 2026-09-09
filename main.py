@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "PawVida Southern Automation"
-VERSION = "9.1.0"
+VERSION = "10.0.0"
 
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "pawvida-6")
@@ -51,6 +51,10 @@ MAX_FREIGHT_SUBSIDY = float(os.getenv("MAX_FREIGHT_SUBSIDY", "6"))
 DEFAULT_CUSTOMER_SHIPPING = float(os.getenv("DEFAULT_CUSTOMER_SHIPPING", "9.95"))
 MINIMUM_ORDER_VALUE = float(os.getenv("MINIMUM_ORDER_VALUE", "39"))
 TARGET_BASKET_CONTRIBUTION = float(os.getenv("TARGET_BASKET_CONTRIBUTION", "12"))
+LAUNCH_TARGET_APPROVED = int(os.getenv("LAUNCH_TARGET_APPROVED", "100"))
+LAUNCH_MAX_CANDIDATES = int(os.getenv("LAUNCH_MAX_CANDIDATES", "300"))
+MIN_RESILIENCE_FOR_PRIORITY = float(os.getenv("MIN_RESILIENCE_FOR_PRIORITY", "0.05"))
+
 
 
 # Competitor benchmark source.
@@ -1114,6 +1118,86 @@ async def top_candidate_market_rows(limit:int=25, per_category:int=20):
     return final
 
 
+
+def resilience_score(required_price, market_ceiling):
+    if not market_ceiling or market_ceiling <= 0:
+        return None
+    return round((market_ceiling - required_price) / market_ceiling, 4)
+
+def launch_priority(row):
+    resilience = row.get("resilience")
+    base = float(row.get("candidate_score") or 0)
+    if resilience is None:
+        return round(base - 20, 1)
+    return round(base + max(-40, min(60, resilience * 200)), 1)
+
+async def launch_candidate_pool(per_category:int=30, max_candidates:int=300):
+    return await candidate_pool(
+        per_category=min(max(per_category,1),30),
+        limit=min(max(max_candidates,1),LAUNCH_MAX_CANDIDATES)
+    )
+
+async def benchmark_candidate_batch(candidates, max_products:int=50):
+    final = []
+    for r in candidates[:max_products]:
+        market = await live_market_for_product(r)
+        hold = list(r.get("hold_reason") or [])
+        if r["stock"] <= 0:
+            status = "TEMP_OUT_OF_STOCK"
+        elif not r["passes_margin"]:
+            status = "COMMERCIAL_HOLD"
+            hold.append("margin")
+        elif not market["verified"]:
+            status = "REVIEW_MARKET"
+            hold.append("market_unverified")
+        elif r["proposed_price"] > market["market_ceiling"]:
+            status = "COMMERCIAL_HOLD"
+            hold.append("market_price")
+        else:
+            status = "APPROVED_DRAFT"
+        resilience = resilience_score(r["proposed_price"], market["market_ceiling"])
+        row = {
+            **r,
+            "market_verified": market["verified"],
+            "market_offer_count": market["offer_count"],
+            "market_benchmark": market["benchmark_price"],
+            "market_ceiling": market["market_ceiling"],
+            "market_offers": market["offers"],
+            "resilience": resilience,
+            "final_status": status,
+            "hold_reason": list(dict.fromkeys(hold)),
+        }
+        row["launch_priority"] = launch_priority(row)
+        final.append(row)
+    final.sort(key=lambda x: (
+        x["final_status"] != "APPROVED_DRAFT",
+        -(x["launch_priority"] or 0),
+        -(x.get("resilience") or -999),
+        -x.get("stock",0)
+    ))
+    return final
+
+async def build_launch_shortlist(per_category:int=30, benchmark_limit:int=50, approved_target:int=100):
+    candidates = await launch_candidate_pool(
+        per_category=per_category,
+        max_candidates=LAUNCH_MAX_CANDIDATES
+    )
+    benchmarked = await benchmark_candidate_batch(
+        candidates,
+        max_products=min(max(benchmark_limit,1),50)
+    )
+    approved = [r for r in benchmarked if r["final_status"] == "APPROVED_DRAFT"]
+    approved.sort(key=lambda x: (-(x.get("launch_priority") or 0), -(x.get("resilience") or 0)))
+    return {
+        "candidates_scanned": len(candidates),
+        "benchmarked": len(benchmarked),
+        "approved_count": len(approved),
+        "approved_target": approved_target,
+        "approved": approved[:approved_target],
+        "all_benchmarked": benchmarked,
+    }
+
+
 @app.get("/")
 async def root():
     return {
@@ -1626,6 +1710,83 @@ async def economics_policy():
             {"retail":"$100+","min_contribution":15.00,"min_margin":0.18},
         ],
     }
+
+
+@app.get("/southern/launch-candidate-pool")
+async def launch_candidate_pool_preview(per_category:int=30, limit:int=300):
+    rows = await launch_candidate_pool(per_category=per_category, max_candidates=limit)
+    return {
+        "ok": True,
+        "dry_run": DRY_RUN,
+        "count": len(rows),
+        "rows": rows,
+        "note": "Large Southern-only pre-screen. No SerpApi calls and no Shopify changes."
+    }
+
+@app.get("/southern/launch-shortlist-preview")
+async def launch_shortlist_preview(per_category:int=30, benchmark_limit:int=25, approved_target:int=100):
+    benchmark_limit = min(max(benchmark_limit,1),50)
+    result = await build_launch_shortlist(
+        per_category=per_category,
+        benchmark_limit=benchmark_limit,
+        approved_target=approved_target
+    )
+    return {"ok": True, "dry_run": DRY_RUN, **result}
+
+@app.get("/southern/launch-shortlist-table", response_class=HTMLResponse)
+async def launch_shortlist_table(per_category:int=30, benchmark_limit:int=25, approved_target:int=100):
+    benchmark_limit = min(max(benchmark_limit,1),50)
+    result = await build_launch_shortlist(
+        per_category=per_category,
+        benchmark_limit=benchmark_limit,
+        approved_target=approved_target
+    )
+    rows = result["all_benchmarked"]
+    trs = []
+    for r in rows:
+        offers = "<br>".join(
+            f"{o.get('retailer')}: ${o.get('price'):.2f}"
+            for o in r.get("market_offers",[])[:3]
+        ) or "—"
+        benchmark = "—" if r["market_benchmark"] is None else f"${r['market_benchmark']:.2f}"
+        ceiling = "—" if r["market_ceiling"] is None else f"${r['market_ceiling']:.2f}"
+        resilience = "—" if r["resilience"] is None else f"{r['resilience']*100:.1f}%"
+        trs.append(
+            f"<tr><td>{r['launch_priority']:.1f}</td>"
+            f"<td>{r.get('source_category','')}</td><td>{r['sku']}</td>"
+            f"<td>{r['product']}</td><td>${r['southern_cost_ex_gst']:.2f}</td>"
+            f"<td>{r['stock']}</td><td>${r['proposed_price']:.2f}</td>"
+            f"<td>{offers}</td><td>{benchmark}</td><td>{ceiling}</td>"
+            f"<td>{r['margin_rate']*100:.1f}%</td><td>{resilience}</td>"
+            f"<td><b>{r['final_status']}</b></td></tr>"
+        )
+    html = f"""
+    <html><head><title>PawVida Launch Shortlist</title>
+    <style>
+    body{{font-family:Arial,sans-serif;margin:26px;color:#1f2d22}}
+    .note{{padding:12px;background:#f3f6ef;border-radius:8px;margin:14px 0}}
+    table{{border-collapse:collapse;width:100%;font-size:12px}}
+    th,td{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}
+    th{{background:#eef4ed;position:sticky;top:0}}
+    </style></head><body>
+    <h1>PawVida — Launch Shortlist</h1>
+    <div class="note">
+      Candidates scanned: {result['candidates_scanned']} |
+      Benchmarked: {result['benchmarked']} |
+      Approved: {result['approved_count']} |
+      Launch target: {approved_target}<br>
+      Dry run. No Shopify changes.
+    </div>
+    <table><thead><tr>
+    <th>Priority</th><th>Category</th><th>SKU</th><th>Product</th>
+    <th>Southern Cost ex GST</th><th>Stock</th><th>Required Price</th>
+    <th>Accepted Offers</th><th>Benchmark</th><th>Ceiling</th>
+    <th>Margin</th><th>Resilience</th><th>Status</th>
+    </tr></thead><tbody>{''.join(trs)}</tbody></table>
+    </body></html>
+    """
+    return HTMLResponse(html)
+
 
 @app.post("/sync/stock")
 async def sync_stock():
